@@ -1,0 +1,18 @@
+{
+  "name": "@orrery-auth-test/test",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest",
+    "coverage": "vitest run --coverage --coverage.provider=istanbul",
+    "lint:package": "publint run --strict",
+    "lint:types": "attw --profile esm-only --pack ."
+  },
+  "devDependencies": {
+    "@orrery/core": "workspace:*",
+    "@better-fetch/fetch": "catalog:",
+    "orrery-auth": "workspace:*",
+    "undici": "^7.30.0",
+    "vitest": "catalog:vitest"
+  }
+}

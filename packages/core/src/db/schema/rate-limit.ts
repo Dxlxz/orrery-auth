@@ -1,0 +1,36 @@
+import * as z from "zod";
+import type { OrreryAuthOptions, Prettify } from "../../types";
+import type {
+	InferDBFieldsFromOptions,
+	InferDBFieldsFromPlugins,
+} from "../type";
+
+export const rateLimitSchema = z.object({
+	/**
+	 * The key to use for rate limiting
+	 */
+	key: z.string(),
+	/**
+	 * The number of requests made
+	 */
+	count: z.number(),
+	/**
+	 * The last request time in milliseconds
+	 */
+	lastRequest: z.number(),
+});
+
+export type BaseRateLimit = z.infer<typeof rateLimitSchema>;
+
+/**
+ * Rate limit schema type used by orrery-auth for rate limiting
+ */
+export type RateLimit<
+	DBOptions extends
+		OrreryAuthOptions["rateLimit"] = OrreryAuthOptions["rateLimit"],
+	Plugins extends OrreryAuthOptions["plugins"] = OrreryAuthOptions["plugins"],
+> = Prettify<
+	BaseRateLimit &
+		InferDBFieldsFromOptions<DBOptions> &
+		InferDBFieldsFromPlugins<"rateLimit", Plugins>
+>;

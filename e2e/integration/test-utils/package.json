@@ -1,0 +1,8 @@
+{
+  "name": "@orrery-auth-test/test-utils",
+  "type": "module",
+  "exports": {
+    "./playwright": "./src/playwright.ts"
+  },
+  "private": true
+}

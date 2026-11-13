@@ -1,0 +1,10 @@
+{
+  "name": "@orrery-auth-test/fixtures-ipv6",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@hono/node-server": "^2.0.10",
+    "orrery-auth": "workspace:*",
+    "hono": "^4.13.7"
+  }
+}

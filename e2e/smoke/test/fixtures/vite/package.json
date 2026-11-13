@@ -1,0 +1,14 @@
+{
+  "name": "@orrery-auth-test/fixtures-vite",
+  "private": true,
+  "scripts": {
+    "build": "vite build",
+    "typecheck:consumer": "tsc --noEmit --project tsconfig.json"
+  },
+  "dependencies": {
+    "orrery-auth": "workspace:*"
+  },
+  "devDependencies": {
+    "vite": "^8.1.5"
+  }
+}

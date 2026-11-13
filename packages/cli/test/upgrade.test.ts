@@ -1,0 +1,193 @@
+import { readFileSync } from "node:fs";
+import prompts from "prompts";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { Spinner } from "yocto-spinner";
+import { upgradeAction } from "../src/commands/upgrade";
+import { detectPackageManager } from "../src/utils/check-package-managers";
+import { getPackageInfo } from "../src/utils/get-package-info";
+import { installDependencies } from "../src/utils/install-dependencies";
+
+// These tests answer prompts as if the run had a terminal.
+vi.mock(import("../src/utils/interactive"));
+
+vi.mock(import("../src/version"), () => ({
+	cliVersion: "1.7.0-rc.4",
+}));
+vi.mock(import("../src/utils/check-package-managers"), { spy: true });
+vi.mock(import("../src/utils/get-package-info"), { spy: true });
+vi.mock(import("../src/utils/install-dependencies"), { spy: true });
+vi.mock(import("yocto-spinner"), () => ({
+	default: vi.fn(() => {
+		const spinner: Spinner = {
+			text: "",
+			color: "cyan",
+			start: vi.fn(() => spinner),
+			stop: vi.fn(() => spinner),
+			success: vi.fn(() => spinner),
+			error: vi.fn(() => spinner),
+			warning: vi.fn(() => spinner),
+			info: vi.fn(() => spinner),
+			clear: vi.fn(() => spinner),
+			get isSpinning() {
+				return false;
+			},
+		};
+		return spinner;
+	}),
+}));
+
+const mockDetectPackageManager = vi.mocked(detectPackageManager);
+const mockGetPackageInfo = vi.mocked(getPackageInfo);
+const mockInstallDependencies = vi.mocked(installDependencies);
+
+describe("upgradeAction", () => {
+	beforeEach(() => {
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		mockGetPackageInfo.mockReturnValue({
+			dependencies: {
+				"orrery-auth": "^1.6.26",
+				"@orrery/core": "1.7.0-beta.10",
+			},
+			devDependencies: {
+				"@orrery/passkey": "~1.6.26",
+			},
+		});
+		mockDetectPackageManager.mockResolvedValue({ packageManager: "pnpm" });
+		mockInstallDependencies.mockResolvedValue(true);
+	});
+
+	it("upgrades Orrery Auth packages to the running CLI version", async () => {
+		await upgradeAction({ cwd: process.cwd(), yes: true });
+
+		expect(mockInstallDependencies).toHaveBeenCalledTimes(2);
+		expect(mockInstallDependencies).toHaveBeenCalledWith({
+			dependencies: ["orrery-auth@1.7.0-rc.4", "@orrery/core@1.7.0-rc.4"],
+			packageManager: "pnpm",
+			cwd: process.cwd(),
+			type: "prod",
+		});
+		expect(mockInstallDependencies).toHaveBeenCalledWith({
+			dependencies: ["@orrery/passkey@1.7.0-rc.4"],
+			packageManager: "pnpm",
+			cwd: process.cwd(),
+			type: "dev",
+		});
+	});
+
+	/**
+	 * @see https://github.com/Dxlxz/orrery-auth/pull/11127#discussion_r3920511930
+	 */
+	it("keeps valid dependencies when another entry is malformed", async () => {
+		mockGetPackageInfo.mockReturnValue({
+			dependencies: {
+				"orrery-auth": "^1.6.26",
+				invalid: 123,
+			},
+		});
+
+		await upgradeAction({ cwd: process.cwd(), yes: true });
+
+		expect(mockInstallDependencies).toHaveBeenCalledWith({
+			dependencies: ["orrery-auth@1.7.0-rc.4"],
+			packageManager: "pnpm",
+			cwd: process.cwd(),
+			type: "prod",
+		});
+	});
+
+	/**
+	 * @see https://github.com/Dxlxz/orrery-auth/pull/10760
+	 */
+	it("upgrades every package in the Changesets fixed release group", async () => {
+		const changesetConfig = JSON.parse(
+			readFileSync(
+				new URL("../../../.changeset/config.json", import.meta.url),
+				"utf8",
+			),
+		) as { fixed: string[][] };
+		const releaseTrainPackages = changesetConfig.fixed
+			.find((group) => group.includes("orrery-auth"))
+			?.filter((name) => name !== "auth");
+
+		expect(releaseTrainPackages).toBeDefined();
+		mockGetPackageInfo.mockReturnValue({
+			dependencies: Object.fromEntries(
+				releaseTrainPackages?.map((name) => [name, "1.6.26"]) ?? [],
+			),
+		});
+
+		await upgradeAction({ cwd: process.cwd(), yes: true });
+
+		expect(mockInstallDependencies).toHaveBeenCalledWith({
+			dependencies: releaseTrainPackages?.map((name) => `${name}@1.7.0-rc.4`),
+			packageManager: "pnpm",
+			cwd: process.cwd(),
+			type: "prod",
+		});
+	});
+
+	it("exits 130 without installing when the upgrade is declined", async () => {
+		const exit = vi.spyOn(process, "exit").mockImplementation(() => {
+			throw new Error("exit");
+		});
+		prompts.inject([false]);
+
+		await expect(upgradeAction({ cwd: process.cwd() })).rejects.toThrow("exit");
+
+		expect(exit).toHaveBeenCalledWith(130);
+		expect(mockInstallDependencies).not.toHaveBeenCalled();
+	});
+
+	it("does not downgrade packages newer than the running CLI", async () => {
+		mockGetPackageInfo.mockReturnValue({
+			dependencies: {
+				"orrery-auth": "^1.7.0",
+				"@orrery/core": "^1.7.0-rc.4",
+			},
+		});
+
+		await upgradeAction({ cwd: process.cwd(), yes: true });
+
+		expect(mockDetectPackageManager).not.toHaveBeenCalled();
+		expect(mockInstallDependencies).not.toHaveBeenCalled();
+	});
+
+	/**
+	 * @see https://github.com/Dxlxz/orrery-auth/issues/11072
+	 */
+	it.each(["catalog:", "file:../orrery-auth"])(
+		"skips unsupported dependency specifier %s",
+		async (specifier) => {
+			const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+			mockGetPackageInfo.mockReturnValue({
+				dependencies: {
+					"orrery-auth": specifier,
+				},
+			});
+
+			await upgradeAction({ cwd: process.cwd(), yes: true });
+
+			expect(warning).toHaveBeenCalledWith(
+				expect.stringContaining("Automatic upgrades require a semver range"),
+			);
+			expect(mockDetectPackageManager).not.toHaveBeenCalled();
+			expect(mockInstallDependencies).not.toHaveBeenCalled();
+		},
+	);
+
+	/**
+	 * @see https://github.com/Dxlxz/orrery-auth/pull/10760
+	 */
+	it("does not align independently versioned Orrery Auth packages", async () => {
+		mockGetPackageInfo.mockReturnValue({
+			dependencies: {
+				"@orrery/utils": "^0.4.0",
+			},
+		});
+
+		await upgradeAction({ cwd: process.cwd(), yes: true });
+
+		expect(mockDetectPackageManager).not.toHaveBeenCalled();
+		expect(mockInstallDependencies).not.toHaveBeenCalled();
+	});
+});

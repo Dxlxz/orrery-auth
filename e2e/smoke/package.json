@@ -1,0 +1,28 @@
+{
+  "name": "@orrery-auth-test/smoke",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@orrery/passkey": "workspace:*",
+    "orrery-auth": "workspace:*"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.29.7",
+    "@orrery-auth-test/test-utils": "workspace:*",
+    "@orrery/cimd": "workspace:*",
+    "@orrery/core": "workspace:*",
+    "@orrery/oauth-provider": "workspace:*",
+    "@orrery/redis-storage": "workspace:*",
+    "@orrery/sso": "workspace:*",
+    "@expo/metro-config": "57.0.12",
+    "@types/babel__core": "^7.20.5",
+    "orrery-auth": "workspace:*",
+    "esbuild": "^0.28.1",
+    "ioredis": "^5.11.1",
+    "msw": "^2.14.6",
+    "oauth4webapi": "3.8.8"
+  },
+  "scripts": {
+    "e2e:smoke": "node --test ./test/*.spec.ts"
+  }
+}

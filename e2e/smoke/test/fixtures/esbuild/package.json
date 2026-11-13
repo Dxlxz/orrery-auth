@@ -1,0 +1,22 @@
+{
+  "name": "@orrery-auth-test/fixtures-esbuild",
+  "private": true,
+  "scripts": {
+    "typecheck:consumer": "tsc --noEmit --project tsconfig.json"
+  },
+  "dependencies": {
+    "@orrery/api-key": "workspace:*",
+    "@orrery/electron": "workspace:*",
+    "@orrery/expo": "workspace:*",
+    "@orrery/kysely-adapter": "workspace:*",
+    "@orrery/scim": "workspace:*",
+    "@orrery/sso": "workspace:*",
+    "@orrery/stripe": "workspace:*",
+    "orrery-auth": "workspace:*",
+    "drizzle-orm": "^0.45.2"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1",
+    "kysely-029": "npm:kysely@0.29.3"
+  }
+}

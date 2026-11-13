@@ -1,0 +1,15 @@
+{
+  "name": "@orrery-auth-test/drizzle-adapter",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "e2e:integration": "vitest run"
+  },
+  "devDependencies": {
+    "@orrery/core": "workspace:*",
+    "@orrery/drizzle-adapter": "workspace:*",
+    "@orrery/scim": "workspace:*",
+    "@orrery/test-utils": "workspace:*",
+    "orrery-auth": "workspace:*"
+  }
+}

@@ -1,0 +1,449 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash, randomUUID } from "node:crypto";
+import type {
+	Awaitable,
+	OrreryAuthClientOptions,
+	OrreryAuthOptions,
+} from "@orrery/core";
+import type { SuccessContext } from "@better-fetch/fetch";
+import { sql } from "kysely";
+import { afterAll } from "vitest";
+import { orreryAuth } from "../auth/full";
+import { createAuthClient } from "../client";
+import { parseSetCookieHeader, setCookieToHeader } from "../cookies";
+import { getAdapter } from "../db/adapter-kysely";
+import { getMigrations } from "../db/get-migration";
+import { bearer } from "../plugins";
+import type { Session, User } from "../types";
+import { getBaseURL, isDynamicBaseURLConfig } from "../utils/url";
+
+const cleanupSet = new Set<Function>();
+
+// One MongoDB database per test file: Vitest loads this module once per file,
+// so files running in parallel cannot drop each other's data. Instances in one
+// file share it, as they share the file's `afterAll` cleanup.
+const mongodbDatabase = `ba_test_${randomUUID().replaceAll("-", "_")}`;
+
+type CurrentUserContext = {
+	headers: Headers;
+};
+const currentUserContextStorage = new AsyncLocalStorage<CurrentUserContext>();
+
+/**
+ * Runs the cleanup of every instance this file created, such as dropping its
+ * database. Each cleanup runs once, even if it throws, since it also closes
+ * the connection a retry would need.
+ *
+ * @internal
+ */
+export async function cleanupTestInstances() {
+	for (const cleanup of cleanupSet) {
+		cleanupSet.delete(cleanup);
+		await cleanup();
+	}
+}
+
+afterAll(cleanupTestInstances);
+
+const TEST_PASSWORD_HASH_PREFIX = "$test$sha256$";
+
+/**
+ * Intentionally fast for tests
+ */
+function createTestPasswordHash(password: string) {
+	return `${TEST_PASSWORD_HASH_PREFIX}${createHash("sha256")
+		.update(password.normalize("NFKC"))
+		.digest("hex")}`;
+}
+
+const testPassword = {
+	hash: async (password: string) => createTestPasswordHash(password),
+	verify: async ({ hash, password }: { hash: string; password: string }) =>
+		hash === createTestPasswordHash(password),
+};
+
+export async function getTestInstance<
+	O extends Partial<OrreryAuthOptions>,
+	C extends OrreryAuthClientOptions,
+>(
+	options?: O | undefined,
+	config?:
+		| {
+				clientOptions?: C;
+				port?: number;
+				disableTestUser?: boolean;
+				testUser?: Partial<User>;
+				testWith?: "sqlite" | "postgres" | "mongodb" | "mysql";
+				transaction?: boolean;
+		  }
+		| undefined,
+) {
+	const testWith = config?.testWith || "sqlite";
+	const postgresSchema =
+		testWith === "postgres"
+			? `ba_test_${randomUUID().replaceAll("-", "_")}`
+			: undefined;
+
+	const mysqlServerURL = "mysql://root:root_password@127.0.0.1:3306";
+	const mysqlDatabase =
+		testWith === "mysql"
+			? `ba_test_${randomUUID().replaceAll("-", "_")}`
+			: undefined;
+
+	const quotePostgresIdentifier = (identifier: string) =>
+		`"${identifier.replaceAll('"', '""')}"`;
+
+	async function getPostgres() {
+		const { Kysely, PostgresDialect } = await import("kysely");
+		const { Pool } = await import("pg");
+		const pool = new Pool({
+			connectionString: "postgres://user:password@localhost:5432/orrery_auth",
+			options: postgresSchema
+				? `-c search_path=${postgresSchema},public`
+				: undefined,
+		});
+		if (postgresSchema) {
+			await pool.query(
+				`CREATE SCHEMA IF NOT EXISTS ${quotePostgresIdentifier(
+					postgresSchema,
+				)}`,
+			);
+		}
+		return new Kysely({
+			dialect: new PostgresDialect({
+				pool,
+			}),
+		});
+	}
+
+	async function getSqlite() {
+		const { DatabaseSync } = await import("node:sqlite");
+		return new DatabaseSync(":memory:");
+	}
+
+	async function getMysql() {
+		const { Kysely, MysqlDialect } = await import("kysely");
+		// Kysely's MysqlDialect drives mysql2's callback API; a mysql2/promise
+		// pool never invokes those callbacks, so every query hangs.
+		const { createConnection, createPool } = await import("mysql2");
+		const admin = createConnection(mysqlServerURL).promise();
+		try {
+			await admin.query(`CREATE DATABASE \`${mysqlDatabase}\``);
+		} finally {
+			await admin.end();
+		}
+		return new Kysely({
+			dialect: new MysqlDialect({
+				pool: createPool(`${mysqlServerURL}/${mysqlDatabase}`),
+			}),
+		});
+	}
+
+	async function getMongodb() {
+		const { MongoClient } = await import("mongodb");
+		// Fail fast in CI/local when Mongo is unreachable instead of hanging
+		// until Vitest's default 10s testTimeout (driver default is 30s).
+		const client = new MongoClient("mongodb://127.0.0.1:27017", {
+			serverSelectionTimeoutMS: 2000,
+			connectTimeoutMS: 2000,
+		});
+		await client.connect();
+		return { client, db: client.db(mongodbDatabase) };
+	}
+
+	const mongodb = testWith === "mongodb" ? await getMongodb() : undefined;
+	const postgres = testWith === "postgres" ? await getPostgres() : undefined;
+	const mysql = testWith === "mysql" ? await getMysql() : undefined;
+	const sqlite = testWith === "sqlite" ? await getSqlite() : undefined;
+
+	const opts = {
+		socialProviders: {
+			github: {
+				clientId: "test",
+				clientSecret: "test",
+			},
+			google: {
+				clientId: "test",
+				clientSecret: "test",
+			},
+		},
+		secret: "orrery-auth-secret-that-is-long-enough-for-validation-test",
+		database: postgres
+			? {
+					db: postgres,
+					type: "postgres",
+					transaction: config?.transaction,
+				}
+			: mongodb
+				? await import("../adapters/mongodb-adapter").then(
+						({ mongodbAdapter }) => mongodbAdapter(mongodb.db),
+					)
+				: mysql
+					? {
+							db: mysql,
+							type: "mysql",
+							transaction: config?.transaction,
+						}
+					: sqlite,
+		emailAndPassword: {
+			enabled: true,
+		},
+		rateLimit: {
+			enabled: false,
+		},
+		advanced: {
+			cookies: {},
+		},
+		logger: {
+			level: "debug",
+		},
+	} satisfies OrreryAuthOptions;
+
+	// Register before migrations and test-user setup so a failed setup still
+	// drops the database it created.
+	const cleanup = async () => {
+		if (mongodb) {
+			try {
+				await mongodb.db.dropDatabase();
+			} finally {
+				await mongodb.client.close();
+			}
+			return;
+		}
+		if (postgres) {
+			try {
+				if (postgresSchema) {
+					await sql
+						.raw(
+							`DROP SCHEMA IF EXISTS ${quotePostgresIdentifier(
+								postgresSchema,
+							)} CASCADE`,
+						)
+						.execute(postgres);
+				} else {
+					await sql`DROP SCHEMA public CASCADE; CREATE SCHEMA public;`.execute(
+						postgres,
+					);
+				}
+			} finally {
+				await postgres.destroy();
+			}
+			return;
+		}
+
+		if (mysql) {
+			try {
+				await sql
+					.raw(`DROP DATABASE IF EXISTS \`${mysqlDatabase}\``)
+					.execute(mysql);
+			} finally {
+				await mysql.destroy();
+			}
+			return;
+		}
+		if (sqlite) {
+			sqlite.close();
+		}
+	};
+	cleanupSet.add(cleanup);
+
+	const authOptions = {
+		baseURL: "http://localhost:" + (config?.port || 3000),
+		...opts,
+		...options,
+		emailAndPassword: {
+			...opts.emailAndPassword,
+			...options?.emailAndPassword,
+			password: options?.emailAndPassword?.password ?? testPassword,
+		},
+		plugins: [bearer(), ...(options?.plugins || [])],
+	} as unknown as O;
+
+	if (testWith !== "mongodb") {
+		const { runMigrations } = await getMigrations({
+			...authOptions,
+			database: opts.database,
+		});
+		await runMigrations();
+	}
+
+	const auth = orreryAuth(authOptions);
+
+	const testUser = {
+		email: "test@test.com",
+		password: "test123456",
+		name: "test user",
+		...config?.testUser,
+	};
+	async function createTestUser() {
+		if (config?.disableTestUser) {
+			return;
+		}
+		// Synthesize a host header from allowedHosts so setup resolves under
+		// dynamic baseURL. `?` is a wildcard, not a query-string delimiter,
+		// so it's replaced, not split on.
+		const dynamicBaseURL = isDynamicBaseURLConfig(auth.options.baseURL)
+			? auth.options.baseURL
+			: undefined;
+		const pattern =
+			dynamicBaseURL?.allowedHosts.find(
+				(h) => !h.includes("*") && !h.includes("?"),
+			) ?? dynamicBaseURL?.allowedHosts[0];
+		const host = pattern
+			?.replace(/^https?:\/\//, "")
+			.split(/[/#]/)[0]
+			?.replace(/\*/g, "test")
+			.replace(/\?/g, "x");
+		const headers = host ? new Headers({ host }) : undefined;
+		//@ts-expect-error
+		await auth.api.signUpEmail({
+			body: testUser,
+			headers,
+		});
+	}
+
+	await createTestUser();
+
+	const customFetchImpl = async (
+		url: string | URL | Request,
+		init?: RequestInit | undefined,
+	) => {
+		const headers = init?.headers || {};
+		const storageHeaders = currentUserContextStorage.getStore()?.headers;
+		return auth.handler(
+			new Request(
+				url,
+				init
+					? {
+							...init,
+							headers: new Headers({
+								...(storageHeaders
+									? Object.fromEntries(storageHeaders.entries())
+									: {}),
+								...(headers instanceof Headers
+									? Object.fromEntries(headers.entries())
+									: typeof headers === "object"
+										? headers
+										: {}),
+							}),
+						}
+					: {
+							headers,
+						},
+			),
+		);
+	};
+
+	const clientBaseURL = isDynamicBaseURLConfig(options?.baseURL)
+		? getBaseURL(
+				"http://localhost:" + (config?.port || 3000),
+				options?.basePath || "/api/auth",
+			)
+		: getBaseURL(
+				typeof options?.baseURL === "string"
+					? options.baseURL
+					: "http://localhost:" + (config?.port || 3000),
+				options?.basePath || "/api/auth",
+			);
+
+	const client = createAuthClient({
+		...(config?.clientOptions as C extends undefined ? {} : C),
+		baseURL: clientBaseURL,
+		fetchOptions: {
+			customFetchImpl,
+		},
+	});
+
+	async function signInWithTestUser() {
+		if (config?.disableTestUser) {
+			throw new Error("Test user is disabled");
+		}
+		const headers = new Headers();
+		const setCookie = (name: string, value: string) => {
+			const current = headers.get("cookie");
+			headers.set("cookie", `${current || ""}; ${name}=${value}`);
+		};
+		//@ts-expect-error
+		const { data } = await client.signIn.email({
+			email: testUser.email,
+			password: testUser.password,
+			fetchOptions: {
+				//@ts-expect-error
+				onSuccess(context) {
+					const header = context.response.headers.get("set-cookie");
+					const cookies = parseSetCookieHeader(header || "");
+					const signedCookie = cookies.get("orrery-auth.session_token")?.value;
+					headers.set("cookie", `orrery-auth.session_token=${signedCookie}`);
+				},
+			},
+		});
+		return {
+			session: data.session as Session,
+			user: data.user as User,
+			headers,
+			setCookie,
+			runWithUser: async (fn: (headers: Headers) => Promise<void>) => {
+				return currentUserContextStorage.run({ headers }, async () => {
+					await fn(headers);
+				});
+			},
+		};
+	}
+	async function signInWithUser(email: string, password: string) {
+		const headers = new Headers();
+		//@ts-expect-error
+		const { data } = await client.signIn.email({
+			email,
+			password,
+			fetchOptions: {
+				//@ts-expect-error
+				onSuccess(context) {
+					const header = context.response.headers.get("set-cookie");
+					const cookies = parseSetCookieHeader(header || "");
+					const signedCookie = cookies.get("orrery-auth.session_token")?.value;
+					headers.set("cookie", `orrery-auth.session_token=${signedCookie}`);
+				},
+			},
+		});
+		return {
+			res: data as {
+				user: User;
+				session: Session;
+			},
+			headers,
+		};
+	}
+
+	function sessionSetter(headers: Headers) {
+		return (context: SuccessContext) => {
+			const header = context.response.headers.get("set-cookie");
+			if (header) {
+				const cookies = parseSetCookieHeader(header || "");
+				const signedCookie = cookies.get("orrery-auth.session_token")?.value;
+				headers.set("cookie", `orrery-auth.session_token=${signedCookie}`);
+			}
+		};
+	}
+
+	return {
+		auth,
+		client,
+		testUser,
+		signInWithTestUser,
+		signInWithUser,
+		cookieSetter: setCookieToHeader,
+		customFetchImpl,
+		sessionSetter,
+		db: await getAdapter(auth.options),
+		runWithUser: async (
+			email: string,
+			password: string,
+			fn: (headers: Headers) => Awaitable<void>,
+		) => {
+			const { headers } = await signInWithUser(email, password);
+			return currentUserContextStorage.run({ headers }, async () => {
+				await fn(headers);
+			});
+		},
+	};
+}

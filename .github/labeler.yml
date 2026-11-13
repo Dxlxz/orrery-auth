@@ -1,0 +1,116 @@
+# Auto-label config for actions/labeler
+# Maps changed file paths to domain labels
+# All matching labels are applied
+
+core:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'packages/orrery-auth/src/auth/**'
+      - 'packages/orrery-auth/src/context/**'
+      - 'packages/orrery-auth/src/types/**'
+      - 'packages/orrery-auth/src/utils/**'
+      - 'packages/orrery-auth/src/crypto/**'
+      - 'packages/orrery-auth/src/api/**'
+      - 'packages/orrery-auth/src/cookies/**'
+      - 'packages/orrery-auth/src/client/**'
+      - 'packages/orrery-auth/src/plugins/jwt/**'
+      - 'packages/orrery-auth/src/plugins/bearer/**'
+      - 'packages/orrery-auth/src/plugins/multi-session/**'
+      - 'packages/orrery-auth/src/plugins/custom-session/**'
+      - 'packages/core/**'
+      - 'packages/redis-storage/**'
+
+database:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'packages/orrery-auth/src/db/**'
+      - 'packages/orrery-auth/src/adapters/**'
+      - 'packages/drizzle-adapter/**'
+      - 'packages/prisma-adapter/**'
+      - 'packages/mongo-adapter/**'
+      - 'packages/kysely-adapter/**'
+      - 'packages/memory-adapter/**'
+
+oauth:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'packages/orrery-auth/src/plugins/generic-oauth/**'
+      - 'packages/orrery-auth/src/plugins/oauth-proxy/**'
+      - 'packages/orrery-auth/src/plugins/one-tap/**'
+      - 'packages/orrery-auth/src/oauth2/**'
+      - 'packages/core/src/social-providers/**'
+      - 'packages/core/src/oauth2/**'
+
+credentials:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'packages/orrery-auth/src/plugins/magic-link/**'
+      - 'packages/orrery-auth/src/plugins/email-otp/**'
+      - 'packages/orrery-auth/src/plugins/phone-number/**'
+      - 'packages/orrery-auth/src/plugins/username/**'
+      - 'packages/orrery-auth/src/plugins/anonymous/**'
+      - 'packages/orrery-auth/src/plugins/siwe/**'
+      - 'packages/passkey/**'
+
+identity:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'packages/oauth-provider/**'
+      - 'packages/orrery-auth/src/plugins/oidc-provider/**'
+      - 'packages/orrery-auth/src/plugins/mcp/**'
+      - 'packages/orrery-auth/src/plugins/device-authorization/**'
+
+organization:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'packages/orrery-auth/src/plugins/organization/**'
+      - 'packages/orrery-auth/src/plugins/admin/**'
+      - 'packages/orrery-auth/src/plugins/access/**'
+
+security:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'packages/orrery-auth/src/plugins/two-factor/**'
+      - 'packages/orrery-auth/src/api/rate-limiter/**'
+      - 'packages/orrery-auth/src/plugins/captcha/**'
+      - 'packages/orrery-auth/src/plugins/haveibeenpwned/**'
+
+enterprise:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'packages/sso/**'
+      - 'packages/scim/**'
+
+payments:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'packages/stripe/**'
+      - 'packages/api-key/**'
+
+platform:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'packages/expo/**'
+      - 'packages/electron/**'
+      - 'packages/orrery-auth/src/integrations/**'
+
+devtools:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'packages/cli/**'
+      - 'packages/orrery-auth/src/plugins/open-api/**'
+      - 'packages/telemetry/**'
+      - 'packages/i18n/**'
+      - 'packages/test-utils/**'
+
+docs:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'docs/**'
+      - 'demo/**'
+
+devops:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '.github/**'
+      - 'e2e/**'

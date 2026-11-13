@@ -1,0 +1,16 @@
+{
+  "name": "@orrery-auth-test/drizzle-v2-relations-adapter",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "e2e:integration": "vitest run"
+  },
+  "devDependencies": {
+    "@orrery/core": "workspace:*",
+    "@orrery/drizzle-adapter": "workspace:*",
+    "@orrery/test-utils": "workspace:*",
+    "orrery-auth": "workspace:*",
+    "drizzle-orm": "1.0.0-rc.3",
+    "drizzle-kit": "1.0.0-rc.3"
+  }
+}

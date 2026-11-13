@@ -1,0 +1,104 @@
+import type {
+	OrreryAuthClientPlugin,
+	ClientAtomListener,
+	ClientFetchOption,
+} from "@orrery/core";
+import { toKebabCase } from "@orrery/core/utils/string";
+import type { BetterFetch } from "@better-fetch/fetch";
+import { isPayloadMethod } from "@better-fetch/fetch";
+import type { Atom } from "nanostores";
+import { isAtom } from "../utils/is-atom";
+import type { ProxyRequest } from "./path-to-object";
+
+export function createDynamicPathProxy<T extends Record<string, any>>(
+	routes: T,
+	client: BetterFetch,
+	knownPathMethods: Record<string, "POST" | "GET">,
+	atoms: Record<string, Atom>,
+	atomListeners: OrreryAuthClientPlugin["atomListeners"],
+): T {
+	function createProxy(path: string[] = []): any {
+		return new Proxy(function () {}, {
+			get(_, prop) {
+				if (typeof prop !== "string") {
+					return undefined;
+				}
+				if (prop === "then" || prop === "catch" || prop === "finally") {
+					return undefined;
+				}
+				const fullPath = [...path, prop];
+				let current: any = routes;
+				for (const segment of fullPath) {
+					if (current && typeof current === "object" && segment in current) {
+						current = current[segment];
+					} else {
+						current = undefined;
+						break;
+					}
+				}
+				if (typeof current === "function") {
+					return current;
+				}
+				if (isAtom(current)) {
+					return current;
+				}
+				return createProxy(fullPath);
+			},
+			apply: async (_, __, args) => {
+				const routePath = "/" + path.map(toKebabCase).join("/");
+				const arg = (args[0] || {}) as ProxyRequest;
+				const fetchOptions = (args[1] || {}) as ClientFetchOption;
+				const { query, fetchOptions: argFetchOptions, ...body } = arg;
+				const options = {
+					...fetchOptions,
+					...argFetchOptions,
+				} as ClientFetchOption;
+				const method =
+					knownPathMethods[routePath] ||
+					options.method ||
+					(Object.keys(body).length > 0 ? "POST" : "GET");
+				return await client(routePath, {
+					...options,
+					body: isPayloadMethod(method)
+						? {
+								...body,
+								...(options?.body || {}),
+							}
+						: undefined,
+					query: query || options?.query,
+					method,
+					async onSuccess(context) {
+						await options?.onSuccess?.(context);
+						if (!atomListeners || options.disableSignal) return;
+						/**
+						 * We trigger listeners
+						 */
+						const matches = atomListeners.filter((s) => s.matcher(routePath));
+						if (!matches.length) return;
+
+						const visited = new Set<ClientAtomListener["signal"]>();
+						for (const match of matches) {
+							const signal = atoms[match.signal as any];
+							if (!signal) return;
+							if (visited.has(match.signal)) {
+								continue;
+							}
+							visited.add(match.signal);
+							/**
+							 * To avoid race conditions we set the signal in a setTimeout
+							 */
+							const val = signal.get();
+							setTimeout(() => {
+								//@ts-expect-error
+								signal.set(!val);
+							}, 10);
+							// we also call the callback if it exists
+							match.callback?.(routePath);
+						}
+					},
+				});
+			},
+		});
+	}
+	return createProxy() as T;
+}

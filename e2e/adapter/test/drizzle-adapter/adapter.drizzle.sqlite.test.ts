@@ -1,0 +1,79 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+import { drizzleAdapter } from "@orrery/drizzle-adapter";
+import { testAdapter } from "@orrery/test-utils/adapter";
+import Database from "better-sqlite3";
+import { drizzle } from "drizzle-orm/better-sqlite3";
+import {
+	authFlowTestSuite,
+	caseInsensitiveTestSuite,
+	joinsTestSuite,
+	normalTestSuite,
+	numberIdTestSuite,
+	transactionsTestSuite,
+	uuidTestSuite,
+} from "../adapter-factory";
+import {
+	clearSchemaCache,
+	generateDrizzleSchema,
+	resetGenerationCount,
+} from "./generate-schema";
+import { pushDrizzleSchema } from "./push-drizzle-schema";
+
+const dbFilePath = path.join(import.meta.dirname, "test.db");
+let sqliteDB = new Database(dbFilePath);
+
+const { execute } = await testAdapter({
+	adapter: async (options) => {
+		const { schema } = await generateDrizzleSchema(sqliteDB, options, "sqlite");
+		return drizzleAdapter(drizzle(sqliteDB, { schema }), {
+			debugLogs: { isRunningAdapterTests: true },
+			schema,
+			provider: "sqlite",
+		});
+	},
+	async runMigrations(orreryAuthOptions) {
+		sqliteDB.close();
+		try {
+			await fs.unlink(dbFilePath);
+		} catch {
+			console.log("db file not found");
+		}
+		sqliteDB = new Database(dbFilePath);
+
+		const { fileName } = await generateDrizzleSchema(
+			sqliteDB,
+			orreryAuthOptions,
+			"sqlite",
+		);
+
+		console.log(`Options:`, orreryAuthOptions);
+		try {
+			await pushDrizzleSchema(
+				import.meta.dirname,
+				"sqlite",
+				`${fileName}.ts`,
+				"./test.db",
+			);
+		} catch (error) {
+			console.error("Failed to push drizzle schema (sqlite):", error);
+			throw error;
+		}
+	},
+	prefixTests: "sqlite",
+	tests: [
+		normalTestSuite(),
+		transactionsTestSuite({ disableTests: { ALL: true } }),
+		authFlowTestSuite(),
+		numberIdTestSuite(),
+		joinsTestSuite(),
+		uuidTestSuite(),
+		caseInsensitiveTestSuite(),
+	],
+	async onFinish() {
+		clearSchemaCache();
+		resetGenerationCount();
+	},
+});
+
+execute();

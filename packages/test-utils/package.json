@@ -1,0 +1,54 @@
+{
+  "name": "@orrery/test-utils",
+  "version": "1.7.23",
+  "description": "Testing utilities for Orrery Auth adapter development",
+  "type": "module",
+  "license": "MIT",
+  "homepage": "https://www.orrery-auth.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Dxlxz/orrery-auth.git",
+    "directory": "packages/test-utils"
+  },
+  "keywords": [
+    "auth",
+    "testing",
+    "typescript",
+    "orrery-auth"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsdown",
+    "dev": "tsdown --watch",
+    "test": "vitest"
+  },
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    "./adapter": {
+      "dev-source": "./src/adapter/index.ts",
+      "default": "./dist/adapter.mjs",
+      "types": "./dist/adapter.d.mts"
+    },
+    "./scim": {
+      "dev-source": "./src/scim-lifecycle.ts",
+      "default": "./dist/scim.mjs",
+      "types": "./dist/scim.d.mts"
+    }
+  },
+  "devDependencies": {
+    "@orrery/core": "workspace:*",
+    "orrery-auth": "workspace:*",
+    "tsdown": "catalog:",
+    "vitest": "catalog:vitest"
+  },
+  "peerDependencies": {
+    "@orrery/core": "workspace:^",
+    "orrery-auth": "workspace:^",
+    "vitest": "^4.0.0 || ^5.0.0"
+  }
+}

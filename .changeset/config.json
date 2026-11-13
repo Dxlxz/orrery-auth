@@ -1,0 +1,44 @@
+{
+  "$schema": "https://unpkg.com/@changesets/config@3.1.3/schema.json",
+  "changelog": [
+    "@changesets/changelog-github",
+    { "repo": "Dxlxz/orrery-auth" }
+  ],
+  "commit": false,
+  "fixed": [
+    [
+      "orrery-auth",
+      "@orrery/core",
+      "auth",
+      "@orrery/api-key",
+      "@orrery/cimd",
+      "@orrery/drizzle-adapter",
+      "@orrery/electron",
+      "@orrery/expo",
+      "@orrery/i18n",
+      "@orrery/kysely-adapter",
+      "@orrery/mcp",
+      "@orrery/memory-adapter",
+      "@orrery/mongo-adapter",
+      "@orrery/oauth-provider",
+      "@orrery/passkey",
+      "@orrery/prisma-adapter",
+      "@orrery/redis-storage",
+      "@orrery/scim",
+      "@orrery/sso",
+      "@orrery/stripe",
+      "@orrery/telemetry",
+      "@orrery/test-utils"
+    ]
+  ],
+  "linked": [],
+  "access": "public",
+  "privatePackages": false,
+  "baseBranch": "main",
+  "updateInternalDependencies": "patch",
+  "bumpVersionsWithWorkspaceProtocolOnly": true,
+  "ignore": ["@orrery-auth-test/adapter-base", "@orrery-auth-test/test-utils"],
+  "___experimentalUnsafeOptions_WILL_CHANGE_IN_PATCH": {
+    "onlyUpdatePeerDependentsWhenOutOfRange": true
+  }
+}

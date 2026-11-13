@@ -1,0 +1,34 @@
+Orrery Auth
+Copyright 2026 Dxlxz
+
+Orrery Auth is an independent, rebranded derivative of Better Auth, which is
+licensed under the MIT License.
+
+    Project : Better Auth
+    Source  : https://github.com/better-auth/better-auth
+    Licence : MIT License (retained verbatim in LICENSE.md)
+
+Changes made in this distribution: the product, npm packages, workspace scope
+(the `@better-auth/*` scope became `@orrery/*`), the `betterAuth()` factory
+(now `orreryAuth()`), TypeScript types, environment variable prefix
+(`BETTER_AUTH_*` -> `ORRERY_AUTH_*`), database table prefix, documentation and
+repository URLs were renamed to Orrery Auth; and the repository history was
+flattened to a single commit.
+
+Orrery Auth is not affiliated with, sponsored by or endorsed by the Better Auth
+authors. Their MIT copyright notice is retained in LICENSE.md as the licence
+requires.
+
+--------------------------------------------------------------------------------
+
+Third-party notices
+--------------------------------------------------------------------------------
+
+This distribution vendors or links the following permissively licensed work:
+
+  * better-auth-ui (MIT) - https://github.com/daveyplate/better-auth-ui
+  * ReUI (MIT) - https://github.com/keenthemes/reui
+  * shadcn/ui (MIT) - https://github.com/shadcn-ui/ui
+
+The complete upstream notice for each package remains available in its own
+package directory and lockfile entry.

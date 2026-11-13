@@ -1,0 +1,24 @@
+{
+  "name": "@orrery-auth-test/integration",
+  "private": true,
+  "scripts": {
+    "e2e:integration": "pnpm --dir nuxt exec nuxt prepare && playwright test"
+  },
+  "dependencies": {
+    "@orrery/cimd": "workspace:*",
+    "@orrery/electron": "workspace:*",
+    "@orrery/kysely-adapter": "workspace:*",
+    "@orrery/mcp": "workspace:*",
+    "@orrery/oauth-provider": "workspace:*",
+    "@orrery/passkey": "workspace:*",
+    "@orrery/scim": "workspace:*",
+    "@orrery/sso": "workspace:*",
+    "@orrery/stripe": "workspace:*",
+    "orrery-auth": "workspace:*"
+  },
+  "devDependencies": {
+    "@orrery-auth-test/test-utils": "workspace:*",
+    "@playwright/test": "~1.64.1",
+    "jose": "^6.2.3"
+  }
+}

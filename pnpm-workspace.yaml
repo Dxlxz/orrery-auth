@@ -1,0 +1,111 @@
+packages:
+  - packages/**
+  - docs
+  - e2e/**
+  - test
+
+overrides:
+  kysely: 0.28.17
+  zod@>=4: 4.6.7
+  fast-xml-parser@: 5.12.0
+  h3@<2: ^1.15.11
+  h3-v2: 'npm:h3@^2.0.1-rc.15'
+  minimatch@<10: '>=10.2.4 <11'
+  cookie@<0.7.0: '>=0.7.2 <0.8'
+  esbuild@<0.28.1: '>=0.28.1 <0.29'
+  path-to-regexp@>=8: 8.4.0
+  undici@>=7 <7.29.1: '>=7.29.1 <8'
+  '@hono/node-server@<2.0.5': '>=2.0.5 <3'
+  postcss@<8.5.18: '>=8.5.18 <9'
+  'ws@<7.5.11': '>=7.5.11 <8'
+  uuid@<11.1.1: '>=11.1.1 <12'
+  'valibot@<1.4.2': '>=1.4.2 <2'
+  sharp: '>=0.35.5 <0.36'
+  # better-sqlite3 12.10.0 added Node 26 support.
+  'better-sqlite3@>=12 <12.10.0': '>=12.10.0 <13'
+  # chromium-edge-launcher depends on @types/node "*". Keep it on the root version so peer variants stay aligned with demo/nextjs.
+  chromium-edge-launcher>@types/node: 25.9.4
+  # vinxi pulls in vite 6, and pnpm would reuse it for the vite peer of vitest.
+  vitest>vite:peer: ^8.0.0
+  # prisma pins mysql2 to an exact version below the security fix.
+  prisma>mysql2: ^3.23.1
+
+catalog:
+  '@orrery/utils': 0.5.1
+  '@better-fetch/fetch': 1.3.3
+  better-call: 1.4.5
+  kysely: ^0.28.17 || ^0.29.0
+  nanostores: ^1.3.0
+  tsdown: 0.23.1
+  typescript: ^6.0.3
+  zod: ^4.5.4
+
+catalogs:
+  peer:
+    '@orrery/utils': ^0.4.2 || ^0.5.0
+    kysely: ^0.28.5 || ^0.29.0
+    nanostores: ^1.0.1
+  react19:
+    '@types/react': ^19.2.17
+    '@types/react-dom': ^19.2.3
+    react: ^19.3.1
+    react-dom: ^19.3.1
+  tailwind:
+    '@tailwindcss/postcss': ^4.3.1
+    tailwindcss: ^4.3.1
+    tailwindcss-animate: ^1.0.7
+  vitest:
+    '@vitest/coverage-istanbul': ^5.0.0
+    '@vitest/ui': ^5.0.0
+    vitest: ^5.0.0
+
+allowBuilds:
+  '@parcel/watcher': true
+  '@prisma/client': true
+  '@prisma/engines': true
+  '@swc/core': true
+  '@tsparticles/engine': true
+  better-sqlite3: true
+  esbuild: true
+  lefthook: true
+  less: true
+  msw: true
+  prisma: true
+  protobufjs: true
+  sharp: true
+  workerd: true
+  electron: false
+
+linkWorkspacePackages: true
+
+autoDedupe: true
+
+lockfile:
+  includeResolutionSettings: true
+
+minimumReleaseAge: 1440
+minimumReleaseAgeExclude:
+  - '@orrery/*'
+  - '@better-fetch/fetch'
+  - 'better-call'
+
+packageExtensions:
+  # @hookform/resolvers imports Zod from its Zod adapter without declaring it.
+  '@hookform/resolvers@5.4.0':
+    peerDependencies:
+      zod: ^3.25.0 || ^4.0.0
+    peerDependenciesMeta:
+      zod:
+        optional: true
+  # drizzle-kit has no drizzle-orm peer, so a monorepo can feed it the wrong version.
+  # https://github.com/drizzle-team/drizzle-orm/issues/5573
+  drizzle-kit:
+    peerDependencies:
+      drizzle-orm: '*'
+
+patchedDependencies:
+  '@changesets/assemble-release-plan': patches/@changesets__assemble-release-plan.patch
+
+trustPolicy: no-downgrade
+
+trustPolicyIgnoreAfter: 43200

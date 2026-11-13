@@ -1,0 +1,173 @@
+import type { OrreryAuthPlugin } from "@orrery/core";
+import { orreryAuth } from "orrery-auth";
+import Database from "better-sqlite3";
+import prompts from "prompts";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { migrateAction } from "../src/commands/migrate";
+import * as config from "../src/utils/get-config";
+
+// These tests answer prompts as if the run had a terminal.
+vi.mock(import("../src/utils/interactive"));
+
+describe("migrate base auth instance", () => {
+	const db = new Database(":memory:");
+
+	const auth = orreryAuth({
+		baseURL: "http://localhost:3000",
+		database: db,
+		emailAndPassword: {
+			enabled: true,
+		},
+	});
+
+	beforeEach(() => {
+		vi.spyOn(process, "exit").mockImplementation((code) => {
+			return code as never;
+		});
+		vi.spyOn(config, "getConfig").mockImplementation(async () => auth.options);
+	});
+
+	it("should migrate the database and sign-up a user", async () => {
+		await migrateAction({
+			cwd: process.cwd(),
+			config: "test/auth.ts",
+			yes: true,
+		});
+		const servingAuth = orreryAuth(auth.options);
+		const signUpRes = await servingAuth.api.signUpEmail({
+			body: {
+				name: "test",
+				email: "test@email.com",
+				password: "password",
+			},
+		});
+		expect(signUpRes.token).toBeDefined();
+	});
+});
+
+describe("migrate auth instance with plugins", () => {
+	const db = new Database(":memory:");
+	const testPlugin = {
+		id: "plugin",
+		schema: {
+			plugin: {
+				fields: {
+					test: {
+						type: "string",
+						fieldName: "test",
+					},
+				},
+			},
+		},
+	} satisfies OrreryAuthPlugin;
+
+	const auth = orreryAuth({
+		baseURL: "http://localhost:3000",
+		database: db,
+		emailAndPassword: {
+			enabled: true,
+		},
+		plugins: [testPlugin],
+	});
+
+	beforeEach(() => {
+		vi.spyOn(process, "exit").mockImplementation((code) => {
+			return code as never;
+		});
+		vi.spyOn(config, "getConfig").mockImplementation(async () => auth.options);
+	});
+
+	it("should migrate the database and sign-up a user", async () => {
+		await migrateAction({
+			cwd: process.cwd(),
+			config: "test/auth.ts",
+			yes: true,
+		});
+		const res = db
+			.prepare("INSERT INTO plugin (id, test) VALUES (?, ?)")
+			.run("1", "test");
+		expect(res.changes).toBe(1);
+	});
+});
+
+describe("migrate an index-only schema change", () => {
+	const db = new Database(":memory:");
+	const basePlugin = {
+		id: "directory",
+		schema: {
+			directoryUser: {
+				fields: {
+					connectionId: { type: "string" },
+					externalId: { type: "string" },
+				},
+			},
+		},
+	} satisfies OrreryAuthPlugin;
+	const indexedPlugin = {
+		...basePlugin,
+		schema: {
+			directoryUser: {
+				...basePlugin.schema.directoryUser,
+				indexes: [
+					{
+						fields: ["connectionId", "externalId"],
+						unique: true,
+					},
+				],
+			},
+		},
+	} satisfies OrreryAuthPlugin;
+	let options = orreryAuth({ database: db, plugins: [basePlugin] }).options;
+
+	beforeEach(() => {
+		vi.spyOn(process, "exit").mockImplementation((code) => code as never);
+		vi.spyOn(config, "getConfig").mockImplementation(async () => options);
+	});
+
+	it("runs when only a compound index is missing", async () => {
+		await migrateAction({ cwd: process.cwd(), yes: true });
+		options = orreryAuth({ database: db, plugins: [indexedPlugin] }).options;
+		const consoleLog = vi.spyOn(console, "log").mockImplementation(() => {});
+
+		await migrateAction({ cwd: process.cwd(), yes: true });
+
+		expect(consoleLog).not.toHaveBeenCalledWith("🚀 No migrations needed.");
+		db.prepare(
+			"INSERT INTO directoryUser (id, connectionId, externalId) VALUES (?, ?, ?)",
+		).run("du1", "okta", "employee-1");
+		expect(() =>
+			db
+				.prepare(
+					"INSERT INTO directoryUser (id, connectionId, externalId) VALUES (?, ?, ?)",
+				)
+				.run("du2", "okta", "employee-1"),
+		).toThrow();
+	});
+});
+
+describe("migrate: declined confirmation", () => {
+	const db = new Database(":memory:");
+	const auth = orreryAuth({
+		baseURL: "http://localhost:3000",
+		database: db,
+	});
+
+	beforeEach(() => {
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		vi.spyOn(config, "getConfig").mockImplementation(async () => auth.options);
+	});
+
+	it("exits 130 without running the migrations", async () => {
+		const exit = vi.spyOn(process, "exit").mockImplementation(() => {
+			throw new Error("exit");
+		});
+		prompts.inject([false]);
+
+		await expect(migrateAction({ cwd: process.cwd() })).rejects.toThrow("exit");
+
+		expect(exit).toHaveBeenCalledWith(130);
+		expect(
+			db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all(),
+		).toEqual([]);
+	});
+});

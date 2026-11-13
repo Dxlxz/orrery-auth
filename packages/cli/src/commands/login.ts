@@ -1,0 +1,142 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
+import { intro, log, outro } from "@clack/prompts";
+import { createAuthClient } from "orrery-auth/client";
+import { deviceAuthorizationClient } from "orrery-auth/client/plugins";
+import chalk from "chalk";
+import { Command } from "commander";
+import open from "open";
+import yoctoSpinner from "yocto-spinner";
+
+const DEMO_URL = "https://demo.orrery-auth.com";
+const TOKEN_FILE = path.join(os.homedir(), ".orrery-auth", "token.json");
+// Login reports progress, not a result, so all of its output stays off stdout.
+const stderr = {
+	output: process.stderr,
+};
+
+async function loginAction(options: { serverUrl: string; clientId: string }) {
+	const authClient = createAuthClient({
+		baseURL: options.serverUrl,
+		plugins: [deviceAuthorizationClient()],
+	});
+
+	intro(chalk.bold("Orrery Auth CLI Login (Demo)"), stderr);
+	const { data: code, error } = await authClient.device.code({
+		client_id: options.clientId,
+		scope: "openid profile email",
+	});
+	if (!code) {
+		log.error(
+			`Failed to request device authorization: ${error.error_description ?? error.statusText}`,
+			stderr,
+		);
+		process.exit(1);
+	}
+
+	log.info(
+		`Visit ${chalk.underline(code.verification_uri)} and enter ${chalk.bold(code.user_code)}`,
+		stderr,
+	);
+	// CI has no browser to open, so the printed URL is enough there.
+	if (!process.env.CI) {
+		await open(code.verification_uri_complete).catch(() => null);
+	}
+
+	const spinner = yoctoSpinner({
+		text: "Waiting for authorization...",
+	}).start();
+	const expiresAt = Date.now() + code.expires_in * 1000;
+	let interval = code.interval;
+	while (Date.now() < expiresAt) {
+		await sleep(interval * 1000);
+		const { data: token, error } = await authClient.device.token({
+			grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+			device_code: code.device_code,
+			client_id: options.clientId,
+		});
+		if (error?.error === "authorization_pending") continue;
+		if (error?.error === "slow_down") {
+			interval += 5;
+			continue;
+		}
+		spinner.stop();
+		if (!token) {
+			log.error(error.error_description ?? error.statusText, stderr);
+			process.exit(1);
+		}
+
+		await fs.mkdir(path.dirname(TOKEN_FILE), { recursive: true, mode: 0o700 });
+		// `mode` only applies on create, so tighten what an older login left behind too.
+		await fs.chmod(path.dirname(TOKEN_FILE), 0o700);
+		await fs.writeFile(
+			TOKEN_FILE,
+			JSON.stringify({
+				serverUrl: options.serverUrl,
+				access_token: token.access_token,
+			}),
+			{ mode: 0o600 },
+		);
+		await fs.chmod(TOKEN_FILE, 0o600);
+		outro(chalk.green("Demo login successful!"), stderr);
+		return;
+	}
+
+	spinner.stop();
+	log.error("The device code has expired. Please try again.", stderr);
+	process.exit(1);
+}
+
+export const login = new Command("login")
+	.description(
+		"Demo: Test device authorization flow with Orrery Auth demo server",
+	)
+	.option("--server-url <url>", "The Orrery Auth server URL", DEMO_URL)
+	.option("--client-id <id>", "The OAuth client ID", "orrery-auth-cli")
+	.action(loginAction);
+
+async function logoutAction() {
+	const stored = await fs
+		.readFile(TOKEN_FILE, "utf-8")
+		.then((content): { serverUrl?: string; access_token: string } =>
+			JSON.parse(content),
+		)
+		.catch(() => null);
+	await fs.rm(TOKEN_FILE, { force: true });
+	if (!stored) {
+		log.info("Not logged in", stderr);
+		return;
+	}
+
+	// Tokens saved before `serverUrl` was stored came from the demo server.
+	const authClient = createAuthClient({
+		baseURL: stored.serverUrl ?? DEMO_URL,
+	});
+	// Unlike sign-out, revoke-session rejects a request it cannot authenticate,
+	// so a server without bearer support is reported instead of silently kept.
+	const result = await authClient
+		.revokeSession({
+			token: stored.access_token,
+			fetchOptions: {
+				headers: {
+					Authorization: `Bearer ${stored.access_token}`,
+				},
+			},
+		})
+		.catch(() => null);
+	if (!result?.data) {
+		log.warn(
+			"Removed the local token, but could not revoke the session on the server",
+			stderr,
+		);
+		process.exitCode = 1;
+		return;
+	}
+	log.success("Logged out", stderr);
+}
+
+export const logout = new Command("logout")
+	.description("Revoke and remove the token stored by the demo login")
+	.action(logoutAction);

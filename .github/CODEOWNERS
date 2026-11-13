@@ -1,0 +1,58 @@
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# Last matching pattern takes precedence.
+# Only lines that CHANGE the owner from the default need to exist.
+# Everything not listed here falls to the global fallback.
+# Teams must have Write access to the repo.
+
+# ── Global fallback (covers: core, devtools, infra, and anything unlisted) ──
+* @orrery/core
+
+# ── Database ──
+/packages/orrery-auth/src/db/                      @orrery/data
+/packages/orrery-auth/src/adapters/                @orrery/data
+/packages/drizzle-adapter/                         @orrery/data
+/packages/prisma-adapter/                          @orrery/data
+/packages/mongo-adapter/                           @orrery/data
+/packages/kysely-adapter/                          @orrery/data
+/packages/memory-adapter/                          @orrery/data
+
+# ── Identity & Auth ──
+/packages/oauth-provider/                          @orrery/identity
+/packages/orrery-auth/src/plugins/oidc-provider/   @orrery/identity
+/packages/orrery-auth/src/plugins/mcp/             @orrery/identity
+/packages/orrery-auth/src/plugins/device-authorization/ @orrery/identity
+/packages/sso/                                     @orrery/identity
+/packages/scim/                                    @orrery/identity
+/packages/core/src/oauth2/                         @orrery/identity
+/packages/orrery-auth/src/oauth2/                  @orrery/identity
+/packages/passkey/                                 @orrery/identity
+/packages/orrery-auth/src/plugins/two-factor/      @orrery/identity
+/packages/orrery-auth/src/plugins/magic-link/      @orrery/identity
+/packages/orrery-auth/src/plugins/email-otp/       @orrery/identity
+/packages/orrery-auth/src/plugins/phone-number/    @orrery/identity
+/packages/orrery-auth/src/plugins/username/        @orrery/identity
+/packages/orrery-auth/src/plugins/anonymous/       @orrery/identity
+/packages/orrery-auth/src/plugins/siwe/            @orrery/identity
+/packages/orrery-auth/src/plugins/captcha/         @orrery/identity
+/packages/orrery-auth/src/plugins/haveibeenpwned/  @orrery/identity
+/packages/orrery-auth/src/plugins/generic-oauth/   @orrery/identity
+/packages/orrery-auth/src/plugins/oauth-proxy/     @orrery/identity
+/packages/orrery-auth/src/plugins/one-tap/         @orrery/identity
+/packages/core/src/social-providers/               @orrery/identity
+
+# ── Plugins (non-auth) ──
+/packages/orrery-auth/src/plugins/organization/    @orrery/plugins
+/packages/orrery-auth/src/plugins/admin/           @orrery/plugins
+/packages/orrery-auth/src/plugins/access/          @orrery/plugins
+/packages/stripe/                                  @orrery/plugins
+/packages/api-key/                                 @orrery/plugins
+
+# ── Platform ──
+/packages/expo/                                    @orrery/platform
+/packages/electron/                                @orrery/platform
+/packages/orrery-auth/src/integrations/            @orrery/platform
+
+# ── Documentation ──
+/docs/                                             @orrery/docs
+/demo/                                             @orrery/docs

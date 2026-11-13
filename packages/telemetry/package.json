@@ -1,0 +1,61 @@
+{
+  "name": "@orrery/telemetry",
+  "version": "1.7.23",
+  "description": "Telemetry package for Orrery Auth",
+  "type": "module",
+  "license": "MIT",
+  "homepage": "https://www.orrery-auth.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Dxlxz/orrery-auth.git",
+    "directory": "packages/telemetry"
+  },
+  "keywords": [
+    "auth",
+    "telemetry",
+    "typescript",
+    "orrery-auth"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsdown",
+    "dev": "tsdown --watch",
+    "lint:package": "publint run --strict --pack false",
+    "lint:types": "attw --profile esm-only --pack .",
+    "typecheck": "tsc --project tsconfig.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "main": "./dist/index.mjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.mts",
+  "exports": {
+    ".": {
+      "dev-source": "./src/index.ts",
+      "types": "./dist/index.d.mts",
+      "node": "./dist/node.mjs",
+      "default": "./dist/index.mjs"
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "index": [
+        "dist/index.d.mts"
+      ]
+    }
+  },
+  "devDependencies": {
+    "@orrery/core": "workspace:*",
+    "tsdown": "catalog:",
+    "type-fest": "^5.7.0"
+  },
+  "peerDependencies": {
+    "@orrery/core": "workspace:^",
+    "@orrery/utils": "catalog:peer",
+    "@better-fetch/fetch": "catalog:"
+  }
+}

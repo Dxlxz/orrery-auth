@@ -1,0 +1,281 @@
+import { execSync } from "node:child_process";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { base64 } from "@orrery/utils/base64";
+import chalk from "chalk";
+import { Command } from "commander";
+
+interface MCPOptions {
+	cursor?: boolean;
+	codex?: boolean;
+	claudeCode?: boolean;
+	openCode?: boolean;
+	manual?: boolean;
+}
+
+const REMOTE_MCP_URL = "https://mcp.orrery-auth.com/mcp";
+
+async function mcpAction(options: MCPOptions) {
+	if (options.cursor) {
+		await handleCursorAction();
+	} else if (options.codex) {
+		handleCodexAction();
+	} else if (options.claudeCode) {
+		handleClaudeCodeAction();
+	} else if (options.openCode) {
+		handleOpenCodeAction();
+	} else if (options.manual) {
+		handleManualAction();
+	} else {
+		showAllOptions();
+	}
+}
+
+async function handleCursorAction() {
+	console.log(chalk.bold.blue("🚀 Adding Orrery Auth MCP to Cursor..."));
+
+	const platform = os.platform();
+	let openCommand: string;
+
+	switch (platform) {
+		case "darwin":
+			openCommand = "open";
+			break;
+		case "win32":
+			openCommand = "start";
+			break;
+		case "linux":
+			openCommand = "xdg-open";
+			break;
+		default:
+			throw new Error(`Unsupported platform: ${platform}`);
+	}
+
+	const remoteConfig = { url: REMOTE_MCP_URL };
+	const encodedRemote = base64.encode(
+		new TextEncoder().encode(JSON.stringify(remoteConfig)),
+	);
+	const remoteDeeplink = `cursor://anysphere.cursor-deeplink/mcp/install?name=${encodeURIComponent("orrery-auth")}&config=${encodedRemote}`;
+
+	try {
+		const cmd =
+			platform === "win32"
+				? `start "" "${remoteDeeplink}"`
+				: `${openCommand} "${remoteDeeplink}"`;
+		execSync(cmd, { stdio: "inherit" });
+	} catch {
+		process.exitCode = 1;
+		console.log(
+			chalk.yellow(
+				"\n⚠ Could not automatically open Cursor for MCP installation.",
+			),
+		);
+		return;
+	}
+	// The deeplink only opens Cursor's install prompt; the user confirms there.
+	console.log(chalk.green("\n✓ Opened Cursor to install the MCP server."));
+
+	console.log(chalk.bold.white("\n✨ Next Steps:"));
+	console.log(chalk.gray("• Confirm the installation in Cursor"));
+	console.log(chalk.gray("• Then use Orrery Auth features directly in Cursor"));
+	console.log(
+		chalk.gray(
+			'• Try: "Set up Orrery Auth with Google login" or "Help me debug my auth"',
+		),
+	);
+}
+
+function handleCodexAction() {
+	console.log(chalk.bold.blue("🤖 Adding Orrery Auth MCP to Codex..."));
+
+	const command = `codex mcp add orrery-auth --url ${REMOTE_MCP_URL}`;
+
+	try {
+		execSync(command, { stdio: "inherit" });
+	} catch {
+		process.exitCode = 1;
+		console.log(
+			chalk.yellow(
+				"\n⚠ Could not automatically add to Codex. Please run this command manually:",
+			),
+		);
+		console.log(chalk.cyan(command));
+		return;
+	}
+	console.log(chalk.green("\n✓ Codex MCP configured!"));
+
+	console.log(chalk.bold.white("\n✨ Next Steps:"));
+	console.log(
+		chalk.gray(
+			"• ChatGPT desktop, Codex CLI, and the IDE extension share this MCP server",
+		),
+	);
+	console.log(chalk.gray("• Run `codex mcp list` to verify the connection"));
+}
+
+function handleClaudeCodeAction() {
+	console.log(chalk.bold.blue("🤖 Adding Orrery Auth MCP to Claude Code..."));
+
+	const command = `claude mcp add --transport http orrery-auth ${REMOTE_MCP_URL}`;
+
+	try {
+		execSync(command, { stdio: "inherit" });
+	} catch {
+		process.exitCode = 1;
+		console.log(
+			chalk.yellow(
+				"\n⚠ Could not automatically add to Claude Code. Please run this command manually:",
+			),
+		);
+		console.log(chalk.cyan(command));
+		return;
+	}
+	console.log(chalk.green("\n✓ Claude Code MCP configured!"));
+
+	console.log(chalk.bold.white("\n✨ Next Steps:"));
+	console.log(
+		chalk.gray(
+			"• You can now use Orrery Auth features directly in Claude Code",
+		),
+	);
+}
+
+function handleOpenCodeAction() {
+	console.log(chalk.bold.blue("🔧 Adding Orrery Auth MCP to Open Code..."));
+
+	const openCodeConfig = {
+		$schema: "https://opencode.ai/config.json",
+		mcp: {
+			"orrery-auth": {
+				type: "remote",
+				url: REMOTE_MCP_URL,
+				enabled: true,
+			},
+		},
+	};
+
+	const configPath = path.join(process.cwd(), "opencode.json");
+
+	try {
+		let existingConfig: {
+			mcp?: Record<string, unknown>;
+			[key: string]: unknown;
+		} = {};
+		if (fs.existsSync(configPath)) {
+			const existingContent = fs.readFileSync(configPath, "utf8");
+			existingConfig = JSON.parse(existingContent);
+		}
+
+		const mergedConfig = {
+			...existingConfig,
+			...openCodeConfig,
+			mcp: {
+				...existingConfig.mcp,
+				...openCodeConfig.mcp,
+			},
+		};
+
+		fs.writeFileSync(configPath, JSON.stringify(mergedConfig, null, 2));
+		console.log(
+			chalk.green(`\n✓ Open Code configuration written to ${configPath}`),
+		);
+		console.log(chalk.green("✓ Orrery Auth MCP server added successfully!"));
+	} catch {
+		process.exitCode = 1;
+		console.log(
+			chalk.yellow(
+				"\n⚠ Could not automatically write opencode.json. Please add this configuration manually:",
+			),
+		);
+		console.log(chalk.cyan(JSON.stringify(openCodeConfig, null, 2)));
+		return;
+	}
+
+	console.log(chalk.bold.white("\n✨ Next Steps:"));
+	console.log(chalk.gray("• Restart Open Code to load the new MCP server"));
+	console.log(
+		chalk.gray("• You can now use Orrery Auth features directly in Open Code"),
+	);
+}
+
+function handleManualAction() {
+	console.log(chalk.bold.blue("📝 Orrery Auth MCP Configuration..."));
+
+	const manualConfig = {
+		"orrery-auth": {
+			url: REMOTE_MCP_URL,
+		},
+	};
+
+	const configPath = path.join(process.cwd(), "mcp.json");
+
+	try {
+		let existingConfig = {};
+		if (fs.existsSync(configPath)) {
+			const existingContent = fs.readFileSync(configPath, "utf8");
+			existingConfig = JSON.parse(existingContent);
+		}
+
+		const mergedConfig = {
+			...existingConfig,
+			...manualConfig,
+		};
+
+		fs.writeFileSync(configPath, JSON.stringify(mergedConfig, null, 2));
+		console.log(chalk.green(`\n✓ MCP configuration written to ${configPath}`));
+		console.log(chalk.green("✓ Orrery Auth MCP server added successfully!"));
+	} catch {
+		process.exitCode = 1;
+		console.log(
+			chalk.yellow(
+				"\n⚠ Could not automatically write mcp.json. Please add this configuration manually:",
+			),
+		);
+		console.log(chalk.cyan(JSON.stringify(manualConfig, null, 2)));
+		return;
+	}
+
+	console.log(chalk.bold.white("\n✨ Next Steps:"));
+	console.log(chalk.gray("• Restart your MCP client to load the new server"));
+	console.log(
+		chalk.gray(
+			"• You can now use Orrery Auth features directly in your MCP client",
+		),
+	);
+}
+
+function showAllOptions() {
+	console.log(chalk.bold.blue("🔌 Orrery Auth MCP Server"));
+	console.log(chalk.gray("Choose your MCP client to get started:"));
+	console.log();
+
+	console.log(chalk.bold.white("MCP Clients:"));
+	console.log(chalk.cyan("  --cursor      ") + chalk.gray("Add to Cursor"));
+	console.log(chalk.cyan("  --codex       ") + chalk.gray("Add to Codex"));
+	console.log(
+		chalk.cyan("  --claude-code ") + chalk.gray("Add to Claude Code"),
+	);
+	console.log(chalk.cyan("  --open-code   ") + chalk.gray("Add to Open Code"));
+	console.log(
+		chalk.cyan("  --manual      ") + chalk.gray("Manual configuration"),
+	);
+	console.log();
+
+	console.log(chalk.bold.white("Server:"));
+	console.log(
+		chalk.gray("  • ") +
+			chalk.white("orrery-auth") +
+			chalk.gray(" - Search documentation, code examples, setup assistance"),
+	);
+	console.log();
+}
+
+export const mcp = new Command("mcp")
+	.description("Add Orrery Auth MCP server to MCP Clients")
+	.option("--cursor", "Add the MCP server to Cursor")
+	.option("--codex", "Add the MCP server to Codex")
+	.option("--claude-code", "Add the MCP server to Claude Code")
+	.option("--open-code", "Add the MCP server to opencode.json")
+	.option("--manual", "Add the MCP server to mcp.json")
+	.action(mcpAction);

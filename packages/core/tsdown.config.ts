@@ -1,0 +1,41 @@
+import { readFile } from "node:fs/promises";
+import { defineConfig } from "tsdown";
+
+const packageJson = JSON.parse(
+	await readFile(new URL("./package.json", import.meta.url), "utf-8"),
+);
+
+export default defineConfig({
+	dts: { build: true, incremental: true },
+	format: ["esm"],
+	entry: [
+		"./src/index.ts",
+		"./src/db/index.ts",
+		"./src/db/internal.ts",
+		"./src/db/adapter/index.ts",
+		"./src/async_hooks/index.ts",
+		"./src/async_hooks/pure.index.ts",
+		"./src/context/index.ts",
+		"./src/env/index.ts",
+		"./src/oauth2/index.ts",
+		"./src/oauth2/internal.ts",
+		"./src/api/index.ts",
+		"./src/social-providers/index.ts",
+		"./src/utils/*.ts",
+		"!./src/utils/*.test.ts",
+		"./src/error/index.ts",
+		"./src/instrumentation/index.ts",
+		"./src/instrumentation/pure.index.ts",
+	],
+	deps: {
+		neverBundle: ["@orrery/core/async_hooks"],
+	},
+	env: {
+		ORRERY_AUTH_VERSION: packageJson.version,
+		ORRERY_AUTH_TELEMETRY_ENDPOINT:
+			process.env.ORRERY_AUTH_TELEMETRY_ENDPOINT ?? "",
+	},
+	unbundle: true,
+	treeshake: true,
+	clean: true,
+});

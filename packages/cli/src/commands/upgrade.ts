@@ -1,0 +1,217 @@
+import { existsSync } from "node:fs";
+import path from "node:path";
+import chalk from "chalk";
+import { Command } from "commander";
+import * as semver from "semver";
+import type { PackageJson } from "type-fest";
+import yoctoSpinner from "yocto-spinner";
+import * as z from "zod";
+import changesetConfig from "../../../../.changeset/config.json" with {
+	type: "json",
+};
+import { detectPackageManager } from "../utils/check-package-managers";
+import { getPackageInfo } from "../utils/get-package-info";
+import { installDependencies } from "../utils/install-dependencies";
+import { prompt } from "../utils/prompt";
+import { cliVersion } from "../version";
+
+const dependencyMapSchema = z
+	.record(z.string(), z.string().catch(""))
+	.catch({});
+
+const fixedReleaseGroup = changesetConfig.fixed.find((group) =>
+	group.includes("orrery-auth"),
+);
+if (!fixedReleaseGroup) {
+	throw new Error("The Orrery Auth fixed release group is not configured.");
+}
+
+const SYNCHRONIZED_ORRERY_AUTH_PACKAGES = new Set(
+	fixedReleaseGroup.filter((name) => name !== "auth"),
+);
+
+function isSynchronizedOrreryAuthPackage(name: string): boolean {
+	return SYNCHRONIZED_ORRERY_AUTH_PACKAGES.has(name);
+}
+
+interface UpgradeEntry {
+	name: string;
+	current: string;
+	target: string;
+	depType: "prod" | "dev";
+}
+
+/** @internal */
+export async function upgradeAction(opts: unknown) {
+	const options = z
+		.object({
+			cwd: z.string(),
+			yes: z.boolean().optional(),
+		})
+		.parse(opts);
+
+	const cwd = path.resolve(options.cwd);
+	if (!existsSync(cwd)) {
+		console.error(`The directory "${cwd}" does not exist.`);
+		process.exit(1);
+	}
+
+	let packageJson: PackageJson;
+	try {
+		packageJson = getPackageInfo(cwd);
+	} catch {
+		console.error(
+			`Could not read package.json in "${cwd}". Make sure you are in a project directory.`,
+		);
+		process.exit(1);
+	}
+
+	const deps = dependencyMapSchema.parse(packageJson.dependencies);
+	const devDeps = dependencyMapSchema.parse(packageJson.devDependencies);
+
+	const candidates: {
+		name: string;
+		current: string;
+		depType: "prod" | "dev";
+	}[] = [];
+
+	for (const [name, version] of Object.entries(deps)) {
+		if (
+			isSynchronizedOrreryAuthPackage(name) &&
+			!version.startsWith("workspace:")
+		) {
+			candidates.push({ name, current: version, depType: "prod" });
+		}
+	}
+	for (const [name, version] of Object.entries(devDeps)) {
+		if (
+			isSynchronizedOrreryAuthPackage(name) &&
+			!version.startsWith("workspace:")
+		) {
+			candidates.push({ name, current: version, depType: "dev" });
+		}
+	}
+
+	if (candidates.length === 0) {
+		console.log("No orrery-auth packages found in this project.");
+		return;
+	}
+
+	const spinner = yoctoSpinner({ text: "checking for updates..." }).start();
+
+	const upgrades: UpgradeEntry[] = [];
+	const warnings: string[] = [];
+	for (const { name, current, depType } of candidates) {
+		const currentRange = semver.validRange(current);
+		if (!currentRange) {
+			warnings.push(
+				`Skipped ${name} (${current}). Automatic upgrades require a semver range.`,
+			);
+			continue;
+		}
+		const currentVersion = semver.minVersion(currentRange);
+		if (currentVersion && semver.lt(currentVersion, cliVersion)) {
+			upgrades.push({
+				name,
+				current,
+				target: cliVersion,
+				depType,
+			});
+		}
+	}
+
+	spinner.stop();
+	for (const warning of warnings) {
+		console.warn(chalk.yellow(warning));
+	}
+
+	if (upgrades.length === 0) {
+		console.log(
+			warnings.length > 0
+				? "No supported Orrery Auth package upgrades were found."
+				: "All orrery-auth packages are up to date.",
+		);
+		return;
+	}
+
+	console.log(`\nThe following packages can be upgraded:\n`);
+	for (const u of upgrades) {
+		console.log(
+			`  ${chalk.cyan(u.name)}  ${chalk.gray(u.current)} ${chalk.white("→")} ${chalk.green(u.target)}`,
+		);
+	}
+	console.log();
+
+	let confirmed = options.yes;
+	if (!confirmed) {
+		const response = await prompt(
+			{
+				type: "confirm",
+				name: "confirmed",
+				message: "Do you want to upgrade these packages?",
+				initial: true,
+			},
+			{
+				action: "install these upgrades",
+				input: "--yes",
+			},
+		);
+		confirmed = response.confirmed;
+	}
+
+	if (!confirmed) {
+		console.log("Upgrade cancelled.");
+		process.exit(130);
+	}
+
+	const { packageManager } = await detectPackageManager(cwd, packageJson);
+	const prodUpgrades = upgrades
+		.filter((u) => u.depType === "prod")
+		.map((u) => `${u.name}@${u.target}`);
+	const devUpgrades = upgrades
+		.filter((u) => u.depType === "dev")
+		.map((u) => `${u.name}@${u.target}`);
+
+	const installSpinner = yoctoSpinner({
+		text: "installing updates...",
+	}).start();
+
+	try {
+		if (prodUpgrades.length > 0) {
+			await installDependencies({
+				dependencies: prodUpgrades,
+				packageManager,
+				cwd,
+				type: "prod",
+			});
+		}
+		if (devUpgrades.length > 0) {
+			await installDependencies({
+				dependencies: devUpgrades,
+				packageManager,
+				cwd,
+				type: "dev",
+			});
+		}
+		installSpinner.stop();
+		console.log(chalk.green("Successfully upgraded orrery-auth packages."));
+	} catch (error) {
+		installSpinner.stop();
+		console.error("Failed to install updates:", error);
+		process.exit(1);
+	}
+}
+
+export const upgrade = new Command("upgrade")
+	.description("Upgrade orrery-auth packages to the running CLI version")
+	.option(
+		"-c, --cwd <cwd>",
+		"the working directory. defaults to the current directory.",
+		process.cwd(),
+	)
+	.option(
+		"-y, --yes",
+		"automatically accept and upgrade without prompting",
+		false,
+	)
+	.action(upgradeAction);

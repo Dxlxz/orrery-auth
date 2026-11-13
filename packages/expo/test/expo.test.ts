@@ -1,0 +1,2132 @@
+import { logger } from "@orrery/core/env";
+import { createAuthEndpoint, createAuthMiddleware } from "orrery-auth/api";
+import { magicLinkClient } from "orrery-auth/client/plugins";
+import { magicLink, oAuthProxy } from "orrery-auth/plugins";
+import { getTestInstance } from "orrery-auth/test";
+import {
+	afterAll,
+	beforeAll,
+	describe,
+	expect,
+	it,
+	onTestFinished,
+	test,
+	vi,
+} from "vitest";
+import { getAuthStateVerificationIdentifier } from "../../orrery-auth/src/state";
+import { expo } from "../src";
+import { expoClient, normalizeCookieName, storageAdapter } from "../src/client";
+import * as clientStorage from "../src/client-storage";
+
+vi.mock("expo-web-browser", async () => {
+	return {
+		openAuthSessionAsync: vi.fn(async (...args) => {
+			fn(...args);
+			return {
+				type: "success",
+				url: "orrery-auth://?cookie=orrery-auth.session_token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjYxMzQwZj",
+			};
+		}),
+	};
+});
+
+vi.mock("react-native", async () => {
+	return {
+		AppState: {
+			addEventListener: vi.fn(),
+			removeEventListener: vi.fn(),
+		},
+		Platform: {
+			OS: "android",
+		},
+	};
+});
+
+vi.mock("expo-constants", async () => {
+	return {
+		default: {
+			platform: {
+				scheme: "orrery-auth",
+			},
+		},
+	};
+});
+
+vi.mock("expo-linking", async () => {
+	return {
+		createURL: vi.fn((url) => `orrery-auth://${url}`),
+	};
+});
+
+const fn = vi.fn();
+
+it("should preserve the public storage exports", () => {
+	expect(storageAdapter).toBe(clientStorage.storageAdapter);
+	expect(normalizeCookieName).toBe(clientStorage.normalizeCookieName);
+});
+
+describe("expo", async () => {
+	const storage = new Map<string, string>();
+
+	const { auth, client, testUser } = await getTestInstance(
+		{
+			emailAndPassword: {
+				enabled: true,
+			},
+			socialProviders: {
+				google: {
+					clientId: "test",
+					clientSecret: "test",
+				},
+			},
+			plugins: [expo(), oAuthProxy()],
+			trustedOrigins: ["orrery-auth://"],
+		},
+		{
+			clientOptions: {
+				plugins: [
+					expoClient({
+						storage: {
+							getItem: (key) => storage.get(key) || null,
+							setItem: async (key, value) => storage.set(key, value),
+							getItemAsync: async (key) => storage.get(key) || null,
+							setItemAsync: async (key, value) => {
+								storage.set(key, value);
+							},
+						},
+					}),
+				],
+			},
+		},
+	);
+
+	beforeAll(async () => {
+		vi.useFakeTimers();
+	});
+	afterAll(() => {
+		vi.useRealTimers();
+	});
+
+	it("should store cookie with expires date", async () => {
+		await client.signIn.email({
+			email: testUser.email,
+			password: testUser.password,
+		});
+		const storedCookie = storage.get("orrery-auth_cookie");
+		expect(storedCookie).toBeDefined();
+		const parsedCookie = JSON.parse(storedCookie || "");
+		expect(parsedCookie["orrery-auth.session_token"]).toMatchObject({
+			value: expect.stringMatching(/.+/),
+			expires: expect.any(String),
+		});
+	});
+
+	it("should send cookie and get session", async () => {
+		const signIn = await client.signIn.email({
+			email: testUser.email,
+			password: testUser.password,
+		});
+		expect(signIn.error).toBeNull();
+
+		const { data } = await client.getSession();
+		expect(data).toMatchObject({
+			session: expect.any(Object),
+			user: expect.any(Object),
+		});
+	});
+
+	it("should use the scheme to open the browser", async () => {
+		const { data: res } = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/dashboard",
+		});
+		const stateId = res?.url?.split("state=")[1]!.split("&")[0];
+		const ctx = await auth.$context;
+		if (!stateId) {
+			throw new Error("State ID not found");
+		}
+		const state = await ctx.internalAdapter.findVerificationValue(
+			getAuthStateVerificationIdentifier(stateId),
+		);
+		const callbackURL = JSON.parse(state?.value || "{}").callbackURL;
+		expect(callbackURL).toBe("orrery-auth:///dashboard");
+		expect(res).toMatchObject({
+			url: expect.stringContaining("accounts.google"),
+		});
+		expect(fn).toHaveBeenCalledWith(
+			expect.stringContaining("accounts.google"),
+			"orrery-auth:///dashboard",
+			undefined,
+		);
+	});
+
+	it("should pass webBrowserOptions to openAuthSessionAsync", async () => {
+		const { client } = await getTestInstance(
+			{
+				plugins: [expo()],
+				trustedOrigins: ["orrery-auth://"],
+				socialProviders: {
+					google: {
+						clientId: "GOOGLE_CLIENT_ID",
+						clientSecret: "GOOGLE_CLIENT_SECRET",
+					},
+				},
+			},
+			{
+				clientOptions: {
+					plugins: [
+						expoClient({
+							storage: {
+								getItem: (key) => storage.get(key) || null,
+								setItem: async (key, value) => storage.set(key, value),
+								getItemAsync: async (key) => storage.get(key) || null,
+								setItemAsync: async (key, value) => {
+									storage.set(key, value);
+								},
+							},
+							webBrowserOptions: {
+								preferEphemeralSession: true,
+							},
+						}),
+					],
+				},
+			},
+		);
+		await client.signIn.social({
+			provider: "google",
+			callbackURL: "/dashboard",
+		});
+		expect(fn).toHaveBeenCalledWith(
+			expect.stringContaining("accounts.google"),
+			"orrery-auth:///dashboard",
+			{
+				preferEphemeralSession: true,
+			},
+		);
+	});
+
+	it("should get cookies", async () => {
+		const c = await client.getCookie();
+		expect(c).includes("orrery-auth.session_token");
+	});
+
+	it("should remove expired cookies from store when Max-Age=0", async () => {
+		const { getSetCookie } = await import("../src/client");
+		const prevCookie = JSON.stringify({
+			"orrery-auth.session_token": { value: "abc123", expires: null },
+			"orrery-auth.session_data": { value: "xyz789", expires: null },
+		});
+		// Server sends Max-Age=0 to delete the cookies
+		const header =
+			"orrery-auth.session_token=; Max-Age=0, orrery-auth.session_data=; Max-Age=0";
+		const result = JSON.parse(getSetCookie(header, prevCookie));
+		expect(result["orrery-auth.session_token"]).toBeUndefined();
+		expect(result["orrery-auth.session_data"]).toBeUndefined();
+	});
+
+	it("should remove cookies with past Expires from store", async () => {
+		const { getSetCookie } = await import("../src/client");
+		const prevCookie = JSON.stringify({
+			"orrery-auth.session_token": { value: "abc123", expires: null },
+		});
+		const pastDate = new Date(Date.now() - 1000).toUTCString();
+		const header = `orrery-auth.session_token=; Expires=${pastDate}`;
+		const result = JSON.parse(getSetCookie(header, prevCookie));
+		expect(result["orrery-auth.session_token"]).toBeUndefined();
+	});
+
+	it("should correctly parse multiple Set-Cookie headers with Expires commas", async () => {
+		const header =
+			"orrery-auth.session_token=abc; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Path=/, orrery-auth.session_data=xyz; Expires=Thu, 22 Oct 2015 07:28:00 GMT; Path=/";
+		const map = (await import("../src/client")).parseSetCookieHeader(header);
+		expect(map.get("orrery-auth.session_token")?.value).toBe("abc");
+		expect(map.get("orrery-auth.session_data")?.value).toBe("xyz");
+	});
+
+	it("should skip cookies with empty names", async () => {
+		const { parseSetCookieHeader, getSetCookie } = await import(
+			"../src/client"
+		);
+
+		// Simulate malformed cookie header starting with semicolon
+		const malformedHeader = "; abc.state=xyz; Path=/";
+		const parsed = parseSetCookieHeader(malformedHeader);
+		expect(parsed.has("")).toBe(false);
+
+		// Test with proper cookie format containing empty-name pattern
+		const header2 = "=empty-value; Path=/, valid-cookie=value; Path=/";
+		const parsed2 = parseSetCookieHeader(header2);
+		expect(parsed2.has("")).toBe(false);
+		expect(parsed2.get("valid-cookie")?.value).toBe("value");
+
+		// Test that existing session cookies are preserved when malformed cookies arrive
+		const prevCookie = JSON.stringify({
+			"abc.session_token": {
+				value: "valid-token",
+				expires: new Date(Date.now() + 1000 * 60 * 60).toISOString(),
+			},
+		});
+		const result = getSetCookie(malformedHeader, prevCookie);
+		const resultParsed = JSON.parse(result);
+		expect(resultParsed["abc.session_token"]).toBeDefined();
+		expect(resultParsed["abc.session_token"].value).toBe("valid-token");
+	});
+
+	it("should not trigger infinite refetch with non-orrery-auth cookies", async () => {
+		const { hasOrreryAuthCookies } = await import("../src/client");
+
+		const orreryAuthOnlyHeader = "orrery-auth.session_token=abc; Path=/";
+		expect(hasOrreryAuthCookies(orreryAuthOnlyHeader, "orrery-auth")).toBe(
+			true,
+		);
+
+		const sessionDataHeader = "orrery-auth.session_data=xyz; Path=/";
+		expect(hasOrreryAuthCookies(sessionDataHeader, "orrery-auth")).toBe(true);
+
+		const secureOrreryAuthHeader =
+			"__Secure-orrery-auth.session_token=abc; Path=/";
+		expect(hasOrreryAuthCookies(secureOrreryAuthHeader, "orrery-auth")).toBe(
+			true,
+		);
+
+		const secureSessionDataHeader =
+			"__Secure-orrery-auth.session_data=xyz; Path=/";
+		expect(hasOrreryAuthCookies(secureSessionDataHeader, "orrery-auth")).toBe(
+			true,
+		);
+
+		const nonOrreryAuthHeader = "__cf_bm=abc123; Path=/; HttpOnly; Secure";
+		expect(hasOrreryAuthCookies(nonOrreryAuthHeader, "orrery-auth")).toBe(
+			false,
+		);
+
+		const mixedHeader =
+			"__cf_bm=abc123; Path=/; HttpOnly; Secure, orrery-auth.session_token=xyz; Path=/";
+		expect(hasOrreryAuthCookies(mixedHeader, "orrery-auth")).toBe(true);
+
+		const customPrefixHeader = "my-app.session_token=abc; Path=/";
+		expect(hasOrreryAuthCookies(customPrefixHeader, "my-app")).toBe(true);
+		expect(hasOrreryAuthCookies(customPrefixHeader, "orrery-auth")).toBe(false);
+
+		const customPrefixDataHeader = "my-app.session_data=abc; Path=/";
+		expect(hasOrreryAuthCookies(customPrefixDataHeader, "my-app")).toBe(true);
+
+		const emptyPrefixHeader = "session_token=abc; Path=/";
+		expect(hasOrreryAuthCookies(emptyPrefixHeader, "")).toBe(true);
+
+		const customFullNameHeader = "my_custom_session_token=abc; Path=/";
+		expect(hasOrreryAuthCookies(customFullNameHeader, "")).toBe(true);
+
+		const customFullDataHeader = "my_custom_session_data=xyz; Path=/";
+		expect(hasOrreryAuthCookies(customFullDataHeader, "")).toBe(true);
+
+		const multipleNonOrreryAuthHeader =
+			"__cf_bm=abc123; Path=/, _ga=GA1.2.123456789.1234567890; Path=/";
+		expect(
+			hasOrreryAuthCookies(multipleNonOrreryAuthHeader, "orrery-auth"),
+		).toBe(false);
+
+		// Non-session orrery-auth cookies should still be detected (e.g., passkey cookies)
+		const nonSessionOrreryAuthHeader = "orrery-auth.other_cookie=abc; Path=/";
+		expect(
+			hasOrreryAuthCookies(nonSessionOrreryAuthHeader, "orrery-auth"),
+		).toBe(true);
+
+		// Passkey cookie should be detected
+		const passkeyHeader = "orrery-auth-passkey=xyz; Path=/";
+		expect(hasOrreryAuthCookies(passkeyHeader, "orrery-auth")).toBe(true);
+
+		// Secure passkey cookie should be detected
+		const securePasskeyHeader = "__Secure-orrery-auth-passkey=xyz; Path=/";
+		expect(hasOrreryAuthCookies(securePasskeyHeader, "orrery-auth")).toBe(true);
+
+		// Custom passkey cookie name should be detected
+		const customPasskeyHeader = "orrery-auth-custom-challenge=xyz; Path=/";
+		expect(hasOrreryAuthCookies(customPasskeyHeader, "orrery-auth")).toBe(true);
+	});
+
+	it("should preserve unchanged client store session properties on signout", async () => {
+		const before = client.$store.atoms.session!.get();
+		await client.signOut();
+		const after = client.$store.atoms.session!.get();
+
+		expect(after).toMatchObject({
+			...before,
+			data: null,
+			error: null,
+			isPending: false,
+		});
+	});
+
+	it("should modify origin header to expo origin if origin is not set", async () => {
+		let originalOrigin = null;
+		let origin = null;
+		const storage = new Map<string, string>();
+		const { client, testUser } = await getTestInstance(
+			{
+				hooks: {
+					before: createAuthMiddleware(async (ctx) => {
+						origin = ctx.request?.headers.get("origin");
+					}),
+				},
+				plugins: [
+					{
+						id: "test",
+						async onRequest(request, ctx) {
+							const origin = request.headers.get("origin");
+							originalOrigin = origin;
+						},
+					},
+					expo(),
+				],
+			},
+			{
+				clientOptions: {
+					plugins: [
+						expoClient({
+							storage: {
+								getItem: (key) => storage.get(key) || null,
+								setItem: async (key, value) => storage.set(key, value),
+								getItemAsync: async (key) => storage.get(key) || null,
+								setItemAsync: async (key, value) => {
+									storage.set(key, value);
+								},
+							},
+						}),
+					],
+				},
+			},
+		);
+		await client.signIn.email({
+			email: testUser.email,
+			password: testUser.password,
+			callbackURL: "http://localhost:3000/callback",
+		});
+		expect(origin).toBe("orrery-auth://");
+		expect(originalOrigin).toBeNull();
+	});
+
+	/**
+	 * @see https://github.com/Dxlxz/orrery-auth/issues/8404
+	 * @see https://github.com/Dxlxz/orrery-auth/issues/7014
+	 */
+	describe("origin override regression", () => {
+		it("should preserve the incoming request instance when headers are mutable", async () => {
+			let originalRequest: Request | undefined;
+			let currentRequest: Request | undefined;
+			const storage = new Map<string, string>();
+			const { client, testUser } = await getTestInstance(
+				{
+					hooks: {
+						before: createAuthMiddleware(async (ctx) => {
+							currentRequest = ctx.request;
+						}),
+					},
+					plugins: [
+						{
+							id: "test",
+							async onRequest(request) {
+								originalRequest = request;
+							},
+						},
+						expo(),
+					],
+				},
+				{
+					clientOptions: {
+						plugins: [
+							expoClient({
+								storage: {
+									getItem: (key) => storage.get(key) || null,
+									setItem: async (key, value) => storage.set(key, value),
+									getItemAsync: async (key) => storage.get(key) || null,
+									setItemAsync: async (key, value) => {
+										storage.set(key, value);
+									},
+								},
+							}),
+						],
+					},
+				},
+			);
+			await client.signIn.email({
+				email: testUser.email,
+				password: testUser.password,
+				callbackURL: "http://localhost:3000/callback",
+			});
+			expect(currentRequest).toBe(originalRequest);
+		});
+
+		it("should clone the request when origin header mutation fails", async () => {
+			let origin = null;
+			let originalRequest: Request | undefined;
+			let currentRequest: Request | undefined;
+			const storage = new Map<string, string>();
+			const { client, testUser } = await getTestInstance(
+				{
+					hooks: {
+						before: createAuthMiddleware(async (ctx) => {
+							currentRequest = ctx.request;
+							origin = ctx.request?.headers.get("origin");
+						}),
+					},
+					plugins: [
+						{
+							id: "test",
+							async onRequest(request) {
+								originalRequest = request;
+								Object.defineProperty(request.headers, "set", {
+									configurable: true,
+									value: () => {
+										throw new Error("immutable headers");
+									},
+								});
+							},
+						},
+						expo(),
+					],
+				},
+				{
+					clientOptions: {
+						plugins: [
+							expoClient({
+								storage: {
+									getItem: (key) => storage.get(key) || null,
+									setItem: async (key, value) => storage.set(key, value),
+									getItemAsync: async (key) => storage.get(key) || null,
+									setItemAsync: async (key, value) => {
+										storage.set(key, value);
+									},
+								},
+							}),
+						],
+					},
+				},
+			);
+			await client.signIn.email({
+				email: testUser.email,
+				password: testUser.password,
+				callbackURL: "http://localhost:3000/callback",
+			});
+			expect(origin).toBe("orrery-auth://");
+			expect(currentRequest).toBeDefined();
+			expect(currentRequest).not.toBe(originalRequest);
+		});
+	});
+
+	it("should not modify origin header if origin is set", async () => {
+		const originalOrigin = "test.com";
+		let origin = null;
+		const { client, testUser } = await getTestInstance({
+			hooks: {
+				before: createAuthMiddleware(async (ctx) => {
+					origin = ctx.request?.headers.get("origin");
+				}),
+			},
+			plugins: [expo()],
+		});
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+				callbackURL: "http://localhost:3000/callback",
+			},
+			{
+				headers: {
+					origin: originalOrigin,
+				},
+			},
+		);
+		expect(origin).toBe(originalOrigin);
+	});
+
+	it("should not modify origin header if disableOriginOverride is set", async () => {
+		let origin = null;
+		const { client, testUser } = await getTestInstance({
+			plugins: [
+				expo({
+					disableOriginOverride: true,
+				}),
+			],
+			hooks: {
+				before: createAuthMiddleware(async (ctx) => {
+					origin = ctx.request?.headers.get("origin");
+				}),
+			},
+		});
+		await client.signIn.email({
+			email: testUser.email,
+			password: testUser.password,
+			callbackURL: "http://localhost:3000/callback",
+		});
+		expect(origin).toBe(null);
+	});
+
+	it("should not send cookie or expo-origin headers for ID token requests", async () => {
+		let cookieHeader: string | null | undefined;
+		let expoOriginHeader: string | null | undefined;
+		let originHeader: string | null | undefined;
+		const storage = new Map<string, string>();
+
+		// Pre-populate storage with a cookie to verify it's NOT sent
+		storage.set(
+			"orrery-auth_cookie",
+			JSON.stringify({
+				"orrery-auth.session_token": {
+					value: "existing-token",
+					expires: new Date(Date.now() + 1000 * 60 * 60).toISOString(),
+				},
+			}),
+		);
+
+		const { client } = await getTestInstance(
+			{
+				hooks: {
+					before: createAuthMiddleware(async (ctx) => {
+						cookieHeader = ctx.request?.headers.get("cookie");
+						expoOriginHeader = ctx.request?.headers.get("expo-origin");
+						originHeader = ctx.request?.headers.get("origin");
+					}),
+				},
+				socialProviders: {
+					google: {
+						clientId: "test",
+						clientSecret: "test",
+					},
+				},
+				plugins: [expo()],
+			},
+			{
+				clientOptions: {
+					plugins: [
+						expoClient({
+							storage: {
+								getItem: (key) => storage.get(key) || null,
+								setItem: async (key, value) => storage.set(key, value),
+								getItemAsync: async (key) => storage.get(key) || null,
+								setItemAsync: async (key, value) => {
+									storage.set(key, value);
+								},
+							},
+						}),
+					],
+				},
+			},
+		);
+
+		// ID token request - should NOT have cookie or expo-origin headers
+		await client.signIn.social({
+			provider: "google",
+			idToken: {
+				token: "fake-id-token",
+			},
+		});
+
+		expect(cookieHeader).toBeNull();
+		expect(expoOriginHeader).toBeNull();
+		expect(originHeader).toBeNull();
+	});
+
+	/**
+	 * @see https://github.com/Dxlxz/orrery-auth/issues/9900
+	 */
+	it("should send cookie and expo-origin for link-social ID token requests", async () => {
+		let cookieHeader: string | null | undefined = null;
+		let expoOriginHeader: string | null | undefined = null;
+		const storage = new Map<string, string>();
+
+		storage.set(
+			"orrery-auth_cookie",
+			JSON.stringify({
+				"orrery-auth.session_token": {
+					value: "existing-token",
+					expires: new Date(Date.now() + 1000 * 60 * 60).toISOString(),
+				},
+			}),
+		);
+
+		const { client } = await getTestInstance(
+			{
+				hooks: {
+					before: createAuthMiddleware(async (ctx) => {
+						cookieHeader = ctx.request?.headers.get("cookie");
+						expoOriginHeader = ctx.request?.headers.get("expo-origin");
+					}),
+				},
+				socialProviders: {
+					google: {
+						clientId: "test",
+						clientSecret: "test",
+					},
+				},
+				plugins: [expo()],
+			},
+			{
+				clientOptions: {
+					plugins: [
+						expoClient({
+							storage: {
+								getItem: (key) => storage.get(key) || null,
+								setItem: async (key, value) => storage.set(key, value),
+								getItemAsync: async (key) => storage.get(key) || null,
+								setItemAsync: async (key, value) => {
+									storage.set(key, value);
+								},
+							},
+						}),
+					],
+				},
+			},
+		);
+
+		await client.linkSocial({
+			provider: "google",
+			idToken: {
+				token: "fake-id-token",
+			},
+		});
+
+		expect(cookieHeader).toContain("orrery-auth.session_token=existing-token");
+		expect(expoOriginHeader).toBe("orrery-auth://");
+	});
+
+	/**
+	 * @see https://github.com/Dxlxz/orrery-auth/issues/9900
+	 */
+	it.each([
+		{
+			trust: "trusted",
+			trustedOrigins: ["orrery-auth://"],
+			expectedError: null,
+			expectedData: expect.objectContaining({ status: true, redirect: false }),
+			expectedAccounts: [
+				expect.objectContaining({
+					providerId: "google",
+					accountId: "google-user",
+				}),
+			],
+		},
+		{
+			trust: "untrusted",
+			trustedOrigins: [],
+			expectedError: expect.objectContaining({
+				status: 403,
+				code: "INVALID_ORIGIN",
+			}),
+			expectedData: null,
+			expectedAccounts: [],
+		},
+	])(
+		"should enforce origin validation for link-social ID token requests with $trust origins",
+		async ({
+			trustedOrigins,
+			expectedError,
+			expectedData,
+			expectedAccounts,
+		}) => {
+			const storage = new Map<string, string>();
+			const profile = {
+				sub: "google-user",
+				name: "Expo User",
+				email: "expo-linking@example.com",
+				email_verified: true,
+				aud: "test",
+				azp: "test",
+				iss: "https://accounts.google.com",
+				iat: Math.floor(Date.now() / 1000),
+				exp: Math.floor(Date.now() / 1000) + 3600,
+				given_name: "Expo",
+				family_name: "User",
+				picture: "https://example.com/avatar.png",
+			};
+			const { client, testUser } = await getTestInstance(
+				{
+					plugins: [expo()],
+					trustedOrigins,
+					advanced: {
+						disableOriginCheck: false,
+						disableCSRFCheck: false,
+					},
+					socialProviders: {
+						google: {
+							clientId: "test",
+							clientSecret: "test",
+							verifyIdToken: async (token) => token === "valid-id-token",
+							getUserInfo: async () => ({
+								user: {
+									name: profile.name,
+									email: profile.email,
+									emailVerified: profile.email_verified,
+								},
+								data: profile,
+							}),
+						},
+					},
+				},
+				{
+					testUser: { email: profile.email },
+					clientOptions: {
+						plugins: [
+							expoClient({
+								storage: {
+									getItem: (key) => storage.get(key) ?? null,
+									setItem: (key, value) => {
+										storage.set(key, value);
+									},
+									getItemAsync: async (key) => storage.get(key) ?? null,
+									setItemAsync: async (key, value) => {
+										storage.set(key, value);
+									},
+								},
+							}),
+						],
+					},
+				},
+			);
+
+			const signIn = await client.signIn.email(
+				{ email: testUser.email, password: testUser.password },
+				{ headers: { origin: "http://localhost:3000" } },
+			);
+			expect(signIn.error).toBeNull();
+
+			const linked = await client.linkSocial({
+				provider: "google",
+				idToken: { token: "valid-id-token" },
+			});
+			expect(linked.error).toEqual(expectedError);
+			expect(linked.data).toEqual(expectedData);
+
+			const accounts = await client.listAccounts();
+			expect(accounts.error).toBeNull();
+			expect(
+				accounts.data?.filter((account) => account.providerId === "google"),
+			).toEqual(expectedAccounts);
+		},
+	);
+
+	it("should preserve existing cookies on link-social", async () => {
+		await client.signIn.email({
+			email: testUser.email,
+			password: testUser.password,
+		});
+		const testCookie = "orrery-auth.test-key";
+		const testCookieValue = "abc";
+
+		const storedCookieBefore = storage.get("orrery-auth_cookie");
+		expect(storedCookieBefore).toBeDefined();
+		const parsedCookieBefore = JSON.parse(storedCookieBefore || "");
+		expect(parsedCookieBefore[testCookie]).toBeUndefined();
+
+		const expoWebBrowser = await import("expo-web-browser");
+		vi.mocked(expoWebBrowser.openAuthSessionAsync).mockResolvedValueOnce({
+			type: "success",
+			url: `orrery-auth://?cookie=${testCookie}=${testCookieValue}`,
+		});
+
+		await client.linkSocial({ provider: "google" });
+
+		const storedCookieAfter = storage.get("orrery-auth_cookie");
+		expect(storedCookieAfter).toBeDefined();
+		const parsedCookieAfter = JSON.parse(storedCookieAfter || "");
+		expect(parsedCookieAfter[testCookie]?.value).toBe(testCookieValue);
+		Object.keys(parsedCookieBefore).forEach((key) => {
+			expect(
+				parsedCookieAfter[key]?.value,
+				`cookie "${key}" value is preserved`,
+			).toBe(parsedCookieBefore[key]?.value);
+		});
+	});
+
+	it("should not corrupt cookies when redirect URL has no cookie param", async () => {
+		await client.signIn.email({
+			email: testUser.email,
+			password: testUser.password,
+		});
+
+		const storedCookieBefore = storage.get("orrery-auth_cookie");
+		expect(storedCookieBefore).toBeDefined();
+		const parsedCookieBefore = JSON.parse(storedCookieBefore || "");
+		expect(parsedCookieBefore["orrery-auth.session_token"]).toBeDefined();
+
+		const expoWebBrowser = await import("expo-web-browser");
+
+		vi.mocked(expoWebBrowser.openAuthSessionAsync).mockResolvedValueOnce({
+			type: "success",
+			url: "orrery-auth:///dashboard", // No cookie param
+		});
+
+		await client.signIn.social({
+			provider: "google",
+			callbackURL: "/dashboard",
+		});
+
+		// Cookies should be preserved, not corrupted with "null" key
+		const storedCookieAfter = storage.get("orrery-auth_cookie");
+		expect(storedCookieAfter).toBeDefined();
+		const parsedCookieAfter = JSON.parse(storedCookieAfter || "");
+
+		// Should NOT have "null" as a cookie key
+		expect(parsedCookieAfter["null"]).toBeUndefined();
+
+		// Original session_token should still exist
+		expect(parsedCookieAfter["orrery-auth.session_token"]).toBeDefined();
+		expect(parsedCookieAfter["orrery-auth.session_token"]?.value).toBe(
+			parsedCookieBefore["orrery-auth.session_token"]?.value,
+		);
+	});
+
+	it("should NOT include oauthState param in proxy URL when using database strategy", async () => {
+		await client.signIn.social({
+			provider: "google",
+			callbackURL: "/dashboard",
+		});
+
+		expect(fn).toHaveBeenCalled();
+		const [url] = fn.mock.calls.at(-1)!;
+		const proxyUrl = new URL(String(url));
+
+		expect(proxyUrl.pathname).toContain("expo-authorization-proxy");
+		expect(proxyUrl.searchParams.has("authorizationURL")).toBe(true);
+		expect(proxyUrl.searchParams.has("oauthState")).toBe(false);
+	});
+});
+
+describe("expo with cookieCache", async () => {
+	const storage = new Map<string, string>();
+
+	const { client, testUser } = await getTestInstance(
+		{
+			session: {
+				expiresIn: 5,
+				cookieCache: {
+					enabled: true,
+					maxAge: 1,
+				},
+			},
+		},
+		{
+			clientOptions: {
+				plugins: [
+					expoClient({
+						storage: {
+							getItem: (key) => storage.get(key) || null,
+							setItem: async (key, value) => storage.set(key, value),
+							getItemAsync: async (key) => storage.get(key) || null,
+							setItemAsync: async (key, value) => {
+								storage.set(key, value);
+							},
+						},
+					}),
+				],
+			},
+		},
+	);
+	beforeAll(async () => {
+		vi.useFakeTimers();
+	});
+	afterAll(() => {
+		vi.useRealTimers();
+	});
+
+	it("should store cookie with expires date", async () => {
+		await client.signIn.email({
+			email: testUser.email,
+			password: testUser.password,
+		});
+		const storedCookie = storage.get("orrery-auth_cookie");
+		expect(storedCookie).toBeDefined();
+		const parsedCookie = JSON.parse(storedCookie || "");
+		expect(parsedCookie["orrery-auth.session_token"]).toMatchObject({
+			value: expect.stringMatching(/.+/),
+			expires: expect.any(String),
+		});
+		expect(parsedCookie["orrery-auth.session_data"]).toMatchObject({
+			value: expect.stringMatching(/.+/),
+			expires: expect.any(String),
+		});
+	});
+	it("should refresh session_data when it expired without erasing session_token", async () => {
+		vi.advanceTimersByTime(1000);
+		const { data } = await client.getSession();
+		expect(data).toMatchObject({
+			session: expect.any(Object),
+			user: expect.any(Object),
+		});
+		const storedCookie = storage.get("orrery-auth_cookie");
+		expect(storedCookie).toBeDefined();
+		const parsedCookie = JSON.parse(storedCookie || "");
+		expect(parsedCookie["orrery-auth.session_token"]).toMatchObject({
+			value: expect.any(String),
+			expires: expect.any(String),
+		});
+		expect(parsedCookie["orrery-auth.session_data"]).toMatchObject({
+			value: expect.any(String),
+			expires: expect.any(String),
+		});
+	});
+
+	it("should erase both session_data and session_token when token expired", async () => {
+		vi.advanceTimersByTime(5000);
+		const { data } = await client.getSession();
+		expect(data).toBeNull();
+		const storedCookie = storage.get("orrery-auth_cookie");
+		expect(storedCookie).toBeDefined();
+		const parsedCookie = JSON.parse(storedCookie || "");
+		expect(parsedCookie["orrery-auth.session_token"]).toMatchObject({
+			value: expect.any(String),
+			expires: expect.any(String),
+		});
+		expect(parsedCookie["orrery-auth.session_data"]).toMatchObject({
+			value: expect.any(String),
+			expires: expect.any(String),
+		});
+	});
+
+	it("should add `exp://` to trusted origins", async () => {
+		vi.stubEnv("NODE_ENV", "development");
+		const { auth } = await getTestInstance({
+			plugins: [expo()],
+			trustedOrigins: ["http://localhost:3000"],
+		});
+		const ctx = await auth.$context;
+		expect(ctx.options.trustedOrigins).toContain("exp://");
+		expect(ctx.options.trustedOrigins).toContain("http://localhost:3000");
+	});
+
+	it("should allow independent cookiePrefix configuration", async () => {
+		const { hasOrreryAuthCookies } = await import("../src/client");
+
+		const customCookieHeader = "my-app.session_token=abc; Path=/";
+
+		expect(hasOrreryAuthCookies(customCookieHeader, "my-app")).toBe(true);
+
+		expect(hasOrreryAuthCookies(customCookieHeader, "orrery-auth")).toBe(false);
+	});
+
+	it("should support array of cookie prefixes", async () => {
+		const { hasOrreryAuthCookies } = await import("../src/client");
+
+		// Test with multiple prefixes - should match any of them
+		const orreryAuthHeader = "orrery-auth.session_token=abc; Path=/";
+		expect(
+			hasOrreryAuthCookies(orreryAuthHeader, ["orrery-auth", "my-app"]),
+		).toBe(true);
+
+		const myAppHeader = "my-app.session_data=xyz; Path=/";
+		expect(hasOrreryAuthCookies(myAppHeader, ["orrery-auth", "my-app"])).toBe(
+			true,
+		);
+
+		const otherAppHeader = "other-app.session_token=def; Path=/";
+		expect(
+			hasOrreryAuthCookies(otherAppHeader, ["orrery-auth", "my-app"]),
+		).toBe(false);
+
+		// Test with passkey cookies
+		const passkeyHeader1 = "orrery-auth-passkey=xyz; Path=/";
+		expect(
+			hasOrreryAuthCookies(passkeyHeader1, ["orrery-auth", "my-app"]),
+		).toBe(true);
+
+		const passkeyHeader2 = "my-app-passkey=xyz; Path=/";
+		expect(
+			hasOrreryAuthCookies(passkeyHeader2, ["orrery-auth", "my-app"]),
+		).toBe(true);
+
+		// Test with __Secure- prefix
+		const secureHeader = "__Secure-my-app.session_token=abc; Path=/";
+		expect(hasOrreryAuthCookies(secureHeader, ["orrery-auth", "my-app"])).toBe(
+			true,
+		);
+
+		// Test with empty array (should check for suffixes)
+		const sessionTokenHeader = "session_token=abc; Path=/";
+		expect(hasOrreryAuthCookies(sessionTokenHeader, [])).toBe(false);
+		expect(hasOrreryAuthCookies(sessionTokenHeader, [""])).toBe(true);
+	});
+
+	/**
+	 * @see https://github.com/Dxlxz/orrery-auth/issues/11082
+	 */
+	describe("chunked storage consistency", () => {
+		function applyCookieResponse(
+			plugin: ReturnType<typeof expoClient>,
+			setCookie: string,
+		) {
+			const onSuccess = plugin.fetchPlugins[0]?.hooks?.onSuccess;
+			if (!onSuccess) {
+				throw new Error("Expo response hook is unavailable");
+			}
+			return onSuccess({
+				request: { url: "https://example.com/api/auth/test" },
+				response: new Response(null, { headers: { "set-cookie": setCookie } }),
+			} as Parameters<typeof onSuccess>[0]);
+		}
+
+		it("should update a value without losing concurrent changes", async () => {
+			const map = new Map<string, string>();
+			const backingStorage = {
+				getItem: (name: string) => map.get(name) ?? null,
+				setItem: (name: string, value: string) => map.set(name, value),
+				getItemAsync: async (name: string) => map.get(name) ?? null,
+				setItemAsync: async (name: string, value: string) => {
+					await new Promise<void>((resolve) => queueMicrotask(resolve));
+					map.set(name, value);
+				},
+			};
+			const first = expoClient({ scheme: "test", storage: backingStorage });
+			const second = expoClient({ scheme: "test", storage: backingStorage });
+
+			await Promise.all([
+				applyCookieResponse(first, "orrery-auth.first=value; Path=/"),
+				applyCookieResponse(second, "orrery-auth.second=value; Path=/"),
+			]);
+
+			const stored =
+				await storageAdapter(backingStorage).getItemAsync("orrery-auth_cookie");
+			expect(JSON.parse(stored ?? "{}")).toMatchObject({
+				"orrery-auth.first": { value: "value" },
+				"orrery-auth.second": { value: "value" },
+			});
+		});
+
+		it("should not notify when a cookie update cannot be stored", async () => {
+			const previousValue = JSON.stringify({
+				"orrery-auth.session_token": { value: "previous", expires: null },
+			});
+			const plugin = expoClient({
+				scheme: "test",
+				storage: {
+					getItem: () => previousValue,
+					setItem: () => {},
+					getItemAsync: async () => previousValue,
+					setItemAsync: async () => {
+						throw new Error("keychain rejected write");
+					},
+				},
+			});
+			const notify = vi.fn();
+			plugin.getActions(undefined, { notify } as unknown as Parameters<
+				typeof plugin.getActions
+			>[1]);
+			const error = vi.spyOn(logger, "error").mockImplementation(() => {});
+
+			await applyCookieResponse(
+				plugin,
+				"orrery-auth.session_token=next; Path=/",
+			);
+
+			expect(error).toHaveBeenCalledTimes(1);
+			expect(notify).not.toHaveBeenCalled();
+		});
+	});
+});
+
+describe("expo with cookie storeStateStrategy", async () => {
+	const storage = new Map<string, string>();
+
+	const { client, auth } = await getTestInstance(
+		{
+			account: {
+				storeStateStrategy: "cookie",
+			},
+			socialProviders: {
+				google: {
+					clientId: "test",
+					clientSecret: "test",
+				},
+			},
+			plugins: [expo(), oAuthProxy()],
+			trustedOrigins: ["orrery-auth://"],
+		},
+		{
+			clientOptions: {
+				plugins: [
+					expoClient({
+						storage: {
+							getItem: (key) => storage.get(key) || null,
+							setItem: async (key, value) => storage.set(key, value),
+							getItemAsync: async (key) => storage.get(key) || null,
+							setItemAsync: async (key, value) => {
+								storage.set(key, value);
+							},
+						},
+					}),
+				],
+			},
+		},
+	);
+
+	beforeAll(async () => {
+		vi.useFakeTimers();
+	});
+
+	afterAll(() => {
+		vi.useRealTimers();
+	});
+
+	it("should include oauthState param in proxy URL", async () => {
+		await client.signIn.social({
+			provider: "google",
+			callbackURL: "/dashboard",
+		});
+
+		expect(fn).toHaveBeenCalled();
+		const [url] = fn.mock.calls.at(-1)!;
+
+		expect(String(url)).toContain("/expo-authorization-proxy");
+		expect(String(url)).toContain("authorizationURL=");
+		expect(String(url)).toContain("oauthState=");
+	});
+
+	it("should set oauth_state cookie in browser context via expo-authorization-proxy (cookie strategy)", async () => {
+		const expoWebBrowser = await import("expo-web-browser");
+		const { parseSetCookieHeader } = await import("../src/client");
+
+		vi.mocked(expoWebBrowser.openAuthSessionAsync).mockImplementationOnce(
+			async (proxyURL, to, webBrowserOptions) => {
+				const proxyUrlStr = String(proxyURL);
+
+				const oauthStateParam = new URL(proxyUrlStr).searchParams.get(
+					"oauthState",
+				);
+				expect(oauthStateParam).toBeTruthy();
+
+				const res = await auth.handler(
+					new Request(proxyUrlStr, { method: "GET" }),
+				);
+
+				expect(res.status).toBe(302);
+
+				const setCookie = res.headers.get("set-cookie");
+				expect(setCookie).toBeTruthy();
+
+				const cookieMap = parseSetCookieHeader(setCookie!);
+				const oauthStateCookie = [...cookieMap.entries()].find(([name]) =>
+					name.includes("oauth_state"),
+				);
+
+				expect(oauthStateCookie).toBeTruthy();
+				expect(oauthStateCookie![1].value).toBe(oauthStateParam);
+
+				fn(proxyURL, to, webBrowserOptions);
+				return {
+					type: "success",
+					url: "orrery-auth://?cookie=orrery-auth.session_token=dummy",
+				};
+			},
+		);
+
+		await client.signIn.social({
+			provider: "google",
+			callbackURL: "/dashboard",
+		});
+		expect(fn).toHaveBeenCalled();
+	});
+});
+
+describe("expo deep link cookie injection", async () => {
+	let magicLinkToken = "";
+	const storage = new Map<string, string>();
+
+	const { client } = await getTestInstance(
+		{
+			plugins: [
+				expo(),
+				magicLink({
+					async sendMagicLink({ token }) {
+						magicLinkToken = token;
+					},
+				}),
+			],
+			trustedOrigins: ["myapp://"],
+		},
+		{
+			clientOptions: {
+				plugins: [
+					expoClient({
+						storage: {
+							getItem: (key) => storage.get(key) || null,
+							setItem: async (key, value) => storage.set(key, value),
+							getItemAsync: async (key) => storage.get(key) || null,
+							setItemAsync: async (key, value) => {
+								storage.set(key, value);
+							},
+						},
+					}),
+					magicLinkClient(),
+				],
+			},
+		},
+	);
+
+	it("should inject cookie into deep link for magic-link verify", async () => {
+		await client.signIn.magicLink({
+			email: "test@example.com",
+			callbackURL: "myapp:///dashboard",
+		});
+
+		let redirectHandled = false;
+		const { error } = await client.magicLink.verify({
+			query: {
+				token: magicLinkToken,
+				callbackURL: "myapp:///dashboard",
+			},
+			fetchOptions: {
+				onError(context) {
+					redirectHandled = true;
+					expect(context.response.status).toBe(302);
+					const location = context.response.headers.get("location");
+					expect(location).toContain("myapp://");
+
+					const url = new URL(location!);
+					const cookie = url.searchParams.get("cookie");
+					expect(cookie).toBeDefined();
+					expect(cookie).toContain("orrery-auth.session_token");
+				},
+			},
+		});
+		expect(redirectHandled).toBe(true);
+		expect(error?.status).toBe(302);
+	});
+});
+
+/**
+ * @see https://github.com/Dxlxz/orrery-auth/issues/6810
+ */
+describe("expo deep link cookie injection with wildcard trustedOrigins", async () => {
+	let magicLinkToken = "";
+	const storage = new Map<string, string>();
+
+	const { client } = await getTestInstance(
+		{
+			plugins: [
+				expo(),
+				magicLink({
+					async sendMagicLink({ token }) {
+						magicLinkToken = token;
+					},
+				}),
+			],
+			trustedOrigins: ["myapp://*"],
+		},
+		{
+			clientOptions: {
+				plugins: [
+					expoClient({
+						storage: {
+							getItem: (key) => storage.get(key) || null,
+							setItem: async (key, value) => storage.set(key, value),
+							getItemAsync: async (key) => storage.get(key) || null,
+							setItemAsync: async (key, value) => {
+								storage.set(key, value);
+							},
+						},
+					}),
+					magicLinkClient(),
+				],
+			},
+		},
+	);
+
+	it("should inject cookie into deep link for wildcard trusted origin", async () => {
+		await client.signIn.magicLink({
+			email: "wildcard-test@example.com",
+			callbackURL: "myapp:///dashboard",
+		});
+
+		let redirectHandled = false;
+		const { error } = await client.magicLink.verify({
+			query: {
+				token: magicLinkToken,
+				callbackURL: "myapp:///dashboard",
+			},
+			fetchOptions: {
+				onError(context) {
+					redirectHandled = true;
+					expect(context.response.status).toBe(302);
+					const location = context.response.headers.get("location");
+					expect(location).toContain("myapp://");
+
+					const url = new URL(location!);
+					const cookie = url.searchParams.get("cookie");
+					expect(cookie).toBeDefined();
+					expect(cookie).toContain("orrery-auth.session_token");
+				},
+			},
+		});
+		expect(redirectHandled).toBe(true);
+		expect(error?.status).toBe(302);
+	});
+});
+
+describe("expo deep link cookie injection for verify-email", async () => {
+	let verificationToken = "";
+	const storage = new Map<string, string>();
+
+	const { client } = await getTestInstance(
+		{
+			emailAndPassword: {
+				enabled: true,
+				requireEmailVerification: true,
+			},
+			emailVerification: {
+				autoSignInAfterVerification: true,
+				async sendVerificationEmail({ token }: { token: string }) {
+					verificationToken = token;
+				},
+			},
+			plugins: [expo()],
+			trustedOrigins: ["myapp://"],
+		},
+		{
+			clientOptions: {
+				plugins: [
+					expoClient({
+						storage: {
+							getItem: (key) => storage.get(key) || null,
+							setItem: async (key, value) => storage.set(key, value),
+							getItemAsync: async (key) => storage.get(key) || null,
+							setItemAsync: async (key, value) => {
+								storage.set(key, value);
+							},
+						},
+					}),
+				],
+			},
+		},
+	);
+
+	it("should inject cookie into deep link for verify-email", async () => {
+		await client.signUp.email({
+			email: "verify-test@example.com",
+			password: "password123",
+			name: "Verify Test",
+		});
+
+		expect(verificationToken).toBeTruthy();
+
+		let redirectHandled = false;
+		const { error } = await client.verifyEmail(
+			{
+				query: {
+					token: verificationToken,
+					callbackURL: "myapp:///verified",
+				},
+			},
+			{
+				onError(context) {
+					redirectHandled = true;
+					expect(context.response.status).toBe(302);
+					const location = context.response.headers.get("location");
+					expect(location).toContain("myapp://");
+
+					const url = new URL(location!);
+					const cookie = url.searchParams.get("cookie");
+					expect(cookie).toBeDefined();
+					expect(cookie).toContain("orrery-auth.session_token");
+				},
+			},
+		);
+		expect(redirectHandled).toBe(true);
+		expect(error?.status).toBe(302);
+	});
+});
+
+/**
+ * @see https://github.com/Dxlxz/orrery-auth/issues/10382
+ */
+describe("expo secure storage availability", () => {
+	it("rejects asynchronously when SecureStore is unavailable", async () => {
+		const storageError = new Error("User interaction is not allowed");
+		const getItem = vi.fn(() => {
+			throw storageError;
+		});
+		const getItemAsync = vi.fn().mockRejectedValue(storageError);
+		const { client } = await getTestInstance(
+			{ plugins: [expo()], trustedOrigins: ["orrery-auth://"] },
+			{
+				clientOptions: {
+					plugins: [
+						expoClient({
+							storage: {
+								getItem,
+								getItemAsync,
+								setItem: vi.fn(),
+								setItemAsync: vi.fn(async () => {}),
+							},
+						}),
+					],
+				},
+			},
+		);
+
+		expect(getItemAsync).not.toHaveBeenCalled();
+		expect(getItem).not.toHaveBeenCalled();
+		await expect(client.getSession()).rejects.toBe(storageError);
+		expect(getItemAsync).toHaveBeenCalled();
+		expect(getItem).not.toHaveBeenCalled();
+	});
+});
+
+/**
+ * @see https://github.com/Dxlxz/orrery-auth/issues/8952
+ */
+describe("expo session cache hydration", async () => {
+	it("shares cold-start hydration without restoring stale session data", async () => {
+		let resolveSessionCacheRead: (value: string | null) => void = () => {};
+		const sessionCacheRead = new Promise<string | null>((resolve) => {
+			resolveSessionCacheRead = resolve;
+		});
+		const getItemAsync = vi.fn((key: string) => {
+			if (key === "orrery-auth_session_data") {
+				return sessionCacheRead;
+			}
+			return Promise.resolve(null);
+		});
+		const setItemAsync = vi.fn(async (_key: string, _value: string) => {});
+		const { client } = await getTestInstance(
+			{ plugins: [expo()], trustedOrigins: ["orrery-auth://"] },
+			{
+				clientOptions: {
+					plugins: [
+						expoClient({
+							storage: {
+								getItem: () => null,
+								setItem: () => {},
+								getItemAsync,
+								setItemAsync,
+							},
+						}),
+					],
+				},
+			},
+		);
+
+		const firstRequest = client.getSession();
+		const secondRequest = client.getSession();
+		await vi.waitFor(() => {
+			expect(getItemAsync).toHaveBeenCalledWith("orrery-auth_session_data");
+		});
+
+		const sessionAtom = client.$store.atoms.session!;
+		const now = new Date();
+		const serverSession = {
+			user: {
+				id: "server-user",
+				name: "Server User",
+				email: "server@example.com",
+				emailVerified: true,
+				createdAt: now,
+				updatedAt: now,
+			},
+			session: {
+				id: "server-session",
+				userId: "server-user",
+				token: "server-token",
+				expiresAt: new Date(now.getTime() + 60_000),
+				createdAt: now,
+				updatedAt: now,
+			},
+		};
+		sessionAtom.set({
+			...sessionAtom.get(),
+			data: serverSession,
+			error: null,
+		});
+		resolveSessionCacheRead(
+			JSON.stringify({
+				user: { id: "cached-user" },
+				session: {
+					id: "cached-session",
+					expiresAt: new Date(Date.now() + 60_000).toISOString(),
+				},
+			}),
+		);
+		await Promise.all([firstRequest, secondRequest]);
+
+		const sessionCacheReads = getItemAsync.mock.calls.filter(
+			([key]) => key === "orrery-auth_session_data",
+		);
+		const sessionCacheWrites = setItemAsync.mock.calls.filter(
+			([key]) => key === "orrery-auth_session_data",
+		);
+		expect(sessionAtom.get().data).toEqual(serverSession);
+		expect(sessionCacheReads).toHaveLength(sessionCacheWrites.length + 1);
+	});
+
+	it("preserves additional fields through the cache round-trip", async () => {
+		const storage = new Map<string, string>();
+		const getItemAsync = vi.fn(async (key: string) => storage.get(key) || null);
+		const setItemAsync = vi.fn(async (key: string, value: string) => {
+			storage.set(key, value);
+		});
+		const sharedClientOptions = {
+			storage: {
+				getItem: (key: string) => storage.get(key) || null,
+				setItem: (key: string, value: string) => storage.set(key, value),
+				getItemAsync,
+				setItemAsync,
+			},
+		};
+		const serverConfig = {
+			emailAndPassword: { enabled: true },
+			user: {
+				additionalFields: {
+					favoriteColor: {
+						type: "string" as const,
+						defaultValue: "blue",
+					},
+				},
+			},
+			session: {
+				additionalFields: {
+					deviceLabel: {
+						type: "string" as const,
+						defaultValue: "test-device",
+					},
+				},
+			},
+			plugins: [expo()],
+			trustedOrigins: ["orrery-auth://"],
+		};
+
+		const { client: writer, testUser } = await getTestInstance(serverConfig, {
+			clientOptions: { plugins: [expoClient(sharedClientOptions)] },
+		});
+		await writer.signIn.email({
+			email: testUser.email,
+			password: testUser.password,
+		});
+		await writer.getSession();
+
+		const { client: coldStart } = await getTestInstance(serverConfig, {
+			clientOptions: { plugins: [expoClient(sharedClientOptions)] },
+		});
+		getItemAsync.mockClear();
+		await coldStart.getSession();
+		expect(getItemAsync).toHaveBeenCalledWith("orrery-auth_session_data");
+		const atom = coldStart.$store.atoms.session!.get();
+		expect(atom.data).toMatchObject({
+			user: { favoriteColor: "blue" },
+			session: { deviceLabel: "test-device" },
+		});
+
+		getItemAsync.mockClear();
+		setItemAsync.mockClear();
+		await coldStart.getSession();
+		const sessionCacheReads = getItemAsync.mock.calls.filter(
+			([key]) => key === "orrery-auth_session_data",
+		);
+		const sessionCacheWrites = setItemAsync.mock.calls.filter(
+			([key]) => key === "orrery-auth_session_data",
+		);
+		expect(sessionCacheReads).toHaveLength(sessionCacheWrites.length);
+	});
+
+	it.each([
+		["expired", new Date(Date.now() - 60_000).toISOString()],
+		["missing", undefined],
+		["invalid", "not-a-date"],
+	])(
+		"does not hydrate when session.expiresAt is %s",
+		async (_label, expiresAt) => {
+			const storage = new Map<string, string>();
+			storage.set(
+				"orrery-auth_session_data",
+				JSON.stringify({
+					user: { id: "u1" },
+					session: { id: "s1", expiresAt },
+				}),
+			);
+
+			const { client } = await getTestInstance(
+				{ plugins: [expo()], trustedOrigins: ["orrery-auth://"] },
+				{
+					clientOptions: {
+						plugins: [
+							expoClient({
+								storage: {
+									getItem: (k) => storage.get(k) || null,
+									setItem: (k, v) => storage.set(k, v),
+									getItemAsync: async (k) => storage.get(k) || null,
+									setItemAsync: async (k, v) => {
+										storage.set(k, v);
+									},
+								},
+							}),
+						],
+					},
+				},
+			);
+
+			await client.getSession();
+			expect(client.$store.atoms.session!.get().data).toBeNull();
+		},
+	);
+
+	it("does not hydrate when disableCache is set", async () => {
+		const storage = new Map<string, string>();
+		const getItemAsync = vi.fn(async (key: string) => storage.get(key) || null);
+		storage.set(
+			"orrery-auth_session_data",
+			JSON.stringify({
+				user: { id: "u1" },
+				session: {
+					id: "s1",
+					expiresAt: new Date(Date.now() + 60_000).toISOString(),
+				},
+			}),
+		);
+
+		const { client } = await getTestInstance(
+			{ plugins: [expo()], trustedOrigins: ["orrery-auth://"] },
+			{
+				clientOptions: {
+					plugins: [
+						expoClient({
+							disableCache: true,
+							storage: {
+								getItem: (k) => storage.get(k) || null,
+								setItem: (k, v) => storage.set(k, v),
+								getItemAsync,
+								setItemAsync: async (k, v) => {
+									storage.set(k, v);
+								},
+							},
+						}),
+					],
+				},
+			},
+		);
+
+		await client.getSession();
+		expect(getItemAsync).not.toHaveBeenCalledWith("orrery-auth_session_data");
+		expect(client.$store.atoms.session!.get().data).toBeNull();
+	});
+});
+
+describe("ExpoFocusManager duplicate notification prevention", () => {
+	it("should not notify listeners when setFocused is called with the same value", async () => {
+		const { setupExpoFocusManager } = await import("../src/focus-manager");
+		const focusManager = setupExpoFocusManager();
+
+		const listener = vi.fn();
+		focusManager.subscribe(listener);
+
+		focusManager.setFocused(true);
+		expect(listener).toHaveBeenCalledTimes(1);
+
+		focusManager.setFocused(true);
+		expect(listener).toHaveBeenCalledTimes(1);
+
+		focusManager.setFocused(false);
+		expect(listener).toHaveBeenCalledTimes(2);
+
+		focusManager.setFocused(false);
+		expect(listener).toHaveBeenCalledTimes(2);
+	});
+});
+
+describe("ExpoOnlineManager duplicate notification prevention", () => {
+	it("should not notify listeners when setOnline is called with the same value", async () => {
+		const { setupExpoOnlineManager } = await import("../src/online-manager");
+		const onlineManager = setupExpoOnlineManager();
+
+		const listener = vi.fn();
+		onlineManager.subscribe(listener);
+
+		onlineManager.setOnline(false);
+		expect(listener).toHaveBeenCalledTimes(1);
+
+		onlineManager.setOnline(false);
+		expect(listener).toHaveBeenCalledTimes(1);
+
+		onlineManager.setOnline(true);
+		expect(listener).toHaveBeenCalledTimes(2);
+
+		onlineManager.setOnline(true);
+		expect(listener).toHaveBeenCalledTimes(2);
+	});
+});
+
+describe("expo authorization proxy", async () => {
+	const { auth } = await getTestInstance({
+		baseURL: "https://app.example",
+		socialProviders: {
+			google: { clientId: "test", clientSecret: "test" },
+		},
+		plugins: [expo()],
+	});
+
+	const proxy = (authorizationURL: string) =>
+		auth.handler(
+			new Request(
+				`https://app.example/api/auth/expo-authorization-proxy?authorizationURL=${encodeURIComponent(
+					authorizationURL,
+				)}`,
+			),
+		);
+
+	it("rejects a same-origin authorizationURL (login-CSRF bounce)", async () => {
+		const res = await proxy(
+			"https://app.example/api/auth/callback/google?state=x",
+		);
+		expect(res.status).toBe(400);
+	});
+
+	it("rejects a non-https authorizationURL", async () => {
+		const res = await proxy(
+			"http://accounts.google.com/o/oauth2/v2/auth?state=x",
+		);
+		expect(res.status).toBe(400);
+	});
+
+	it("rejects a malformed authorizationURL", async () => {
+		const res = await proxy("not-a-url");
+		expect(res.status).toBe(400);
+	});
+
+	it("rejects an authorizationURL with a fragment", async () => {
+		const withFragment = await proxy(
+			"https://accounts.google.com/o/oauth2/v2/auth?state=x#fragment",
+		);
+		expect(withFragment.status).toBe(400);
+		const bareFragment = await proxy(
+			"https://accounts.google.com/o/oauth2/v2/auth?state=x#",
+		);
+		expect(bareFragment.status).toBe(400);
+	});
+
+	it("redirects to an external https provider authorization endpoint", async () => {
+		const target =
+			"https://accounts.google.com/o/oauth2/v2/auth?client_id=x&state=abc";
+		const res = await proxy(target);
+		expect(res.headers.get("location")).toBe(target);
+	});
+
+	it.for([
+		"https://accounts.google.com/o/oauth2/v2/auth?client_id=x",
+		"https://accounts.google.com/o/oauth2/v2/auth?client_id=x&state=",
+	])(
+		"rejects a provider authorizationURL without state before setting the oauth_state cookie: %s",
+		async (authorizationURL) => {
+			const res = await auth.handler(
+				new Request(
+					`https://app.example/api/auth/expo-authorization-proxy?authorizationURL=${encodeURIComponent(
+						authorizationURL,
+					)}&oauthState=planted`,
+				),
+			);
+			expect(res.status).toBe(400);
+			expect(res.headers.get("location")).toBeNull();
+			expect(res.headers.get("set-cookie")).toBeNull();
+		},
+	);
+
+	it("rejects an unconfigured authorization origin without setting cookies", async () => {
+		const res = await proxy("https://unconfigured.example/authorize?state=abc");
+		expect(res.status).toBe(400);
+		expect(res.headers.get("location")).toBeNull();
+		expect(res.headers.get("set-cookie")).toBeNull();
+	});
+
+	test.for([false, true])(
+		"rejects provider URL generation failures with asynchronous=%s",
+		async (asynchronous) => {
+			const { auth } = await getTestInstance({
+				baseURL: "https://app.example",
+				socialProviders: {
+					google: {
+						clientId: "test",
+						clientSecret: "test",
+					},
+				},
+				plugins: [
+					expo(),
+					{
+						id: "unavailable-authorization-provider",
+						init(ctx) {
+							return {
+								context: {
+									socialProviders: ctx.socialProviders.map((provider) => ({
+										...provider,
+										createAuthorizationURL: asynchronous
+											? async () => {
+													throw new Error("Authorization URL unavailable");
+												}
+											: () => {
+													throw new Error("Authorization URL unavailable");
+												},
+									})),
+								},
+							};
+						},
+					},
+				],
+			});
+			const res = await auth.handler(
+				new Request(
+					"https://app.example/api/auth/expo-authorization-proxy?authorizationURL=https%3A%2F%2Faccounts.google.com%2Fauthorize%3Fstate%3Dabc",
+				),
+			);
+			expect(res.status).toBe(400);
+			expect(res.headers.get("location")).toBeNull();
+			expect(res.headers.get("set-cookie")).toBeNull();
+		},
+	);
+
+	/**
+	 * @see https://github.com/Dxlxz/orrery-auth/issues/12307
+	 */
+	describe("provider configured for ID token sign-in only", () => {
+		const cases = [
+			{
+				name: "apple",
+				socialProviders: {
+					apple: {
+						clientId: "com.example.app",
+						appBundleIdentifier: "com.example.app",
+					},
+					google: { clientId: "test", clientSecret: "test" },
+				},
+				authorizationURL:
+					"https://accounts.google.com/o/oauth2/v2/auth?state=x",
+				unavailableURL: "https://appleid.apple.com/auth/authorize?state=x",
+			},
+			{
+				name: "google",
+				socialProviders: {
+					google: { clientId: "test" },
+					github: { clientId: "test", clientSecret: "test" },
+				},
+				authorizationURL: "https://github.com/login/oauth/authorize?state=x",
+				unavailableURL: "https://accounts.google.com/o/oauth2/v2/auth?state=x",
+			},
+		];
+
+		const createProxy = async ({ socialProviders }: (typeof cases)[number]) => {
+			const { auth } = await getTestInstance(
+				{
+					baseURL: "https://app.example",
+					socialProviders,
+					plugins: [expo()],
+				},
+				{
+					disableTestUser: true,
+				},
+			);
+			return (authorizationURL: string) =>
+				auth.handler(
+					new Request(
+						`https://app.example/api/auth/expo-authorization-proxy?authorizationURL=${encodeURIComponent(
+							authorizationURL,
+						)}`,
+					),
+				);
+		};
+
+		it.for(cases)(
+			"does not log on every proxy request: $name",
+			async (testCase) => {
+				const proxy = await createProxy(testCase);
+				const error = vi.spyOn(logger, "error").mockImplementation(() => {});
+
+				const responses = await Promise.all([
+					proxy(testCase.authorizationURL),
+					proxy(testCase.authorizationURL),
+					proxy(testCase.authorizationURL),
+				]);
+				responses.push(await proxy(testCase.authorizationURL));
+				responses.push(await proxy(testCase.authorizationURL));
+
+				for (const res of responses) {
+					expect(res.headers.get("location")).toBe(testCase.authorizationURL);
+				}
+				expect(error.mock.calls.length).toBeLessThanOrEqual(1);
+			},
+		);
+
+		it.for(cases)(
+			"keeps rejecting the provider that cannot build an authorization URL: $name",
+			async (testCase) => {
+				const proxy = await createProxy(testCase);
+				vi.spyOn(logger, "error").mockImplementation(() => {});
+
+				for (let i = 0; i < 2; i++) {
+					const res = await proxy(testCase.unavailableURL);
+					expect(res.status).toBe(400);
+					expect(res.headers.get("location")).toBeNull();
+					expect(res.headers.get("set-cookie")).toBeNull();
+				}
+			},
+		);
+	});
+
+	it("rejects a trusted origin that is not a provider authorization endpoint", async () => {
+		const { auth } = await getTestInstance({
+			baseURL: "https://app.example",
+			trustedOrigins: ["https://web.app.example"],
+			socialProviders: {
+				google: { clientId: "test", clientSecret: "test" },
+			},
+			plugins: [expo()],
+		});
+		const res = await auth.handler(
+			new Request(
+				`https://app.example/api/auth/expo-authorization-proxy?authorizationURL=${encodeURIComponent(
+					"https://web.app.example/api/auth/callback/google?state=abc",
+				)}`,
+			),
+		);
+		expect(res.status).toBe(400);
+		expect(res.headers.get("location")).toBeNull();
+		expect(res.headers.get("set-cookie")).toBeNull();
+	});
+
+	describe("authorization endpoints issued at sign-in", () => {
+		const issuing = (path: string, authorizationURL: string) => ({
+			id: `issue${path.replaceAll("/", "-")}`,
+			endpoints: {
+				issue: createAuthEndpoint(path, { method: "POST" }, async (ctx) =>
+					ctx.json({ url: authorizationURL, redirect: true }),
+				),
+			},
+		});
+		const createIssuer = async (path: string, authorizationURL: string) => {
+			const { auth } = await getTestInstance({
+				baseURL: "https://app.example",
+				trustedOrigins: ["https://idp.example", "https://web.app.example"],
+				plugins: [expo(), issuing(path, authorizationURL)],
+			});
+			await auth.handler(
+				new Request(`https://app.example/api/auth${path}`, {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: "{}",
+				}),
+			);
+			return (target: string) =>
+				auth.handler(
+					new Request(
+						`https://app.example/api/auth/expo-authorization-proxy?authorizationURL=${encodeURIComponent(
+							target,
+						)}`,
+					),
+				);
+		};
+
+		it("redirects to the authorization endpoint an SSO sign-in issued", async () => {
+			const issued = "https://idp.example/authorize?state=sso-state";
+			const proxyFor = await createIssuer("/sign-in/sso", issued);
+			const res = await proxyFor(issued);
+			expect(res.status).toBe(302);
+			expect(res.headers.get("location")).toBe(issued);
+		});
+
+		it("does not accept an SSO origin for a state it was not issued with", async () => {
+			const proxyFor = await createIssuer(
+				"/sign-in/sso",
+				"https://idp.example/authorize?state=sso-state",
+			);
+			const res = await proxyFor(
+				"https://idp.example/authorize?state=other-state",
+			);
+			expect(res.status).toBe(400);
+			expect(res.headers.get("set-cookie")).toBeNull();
+		});
+
+		it("does not accept an SSO origin that is not trusted", async () => {
+			const issued = "https://unlisted-idp.example/authorize?state=sso-state";
+			const proxyFor = await createIssuer("/sign-in/sso", issued);
+			const res = await proxyFor(issued);
+			expect(res.status).toBe(400);
+			expect(res.headers.get("location")).toBeNull();
+			expect(res.headers.get("set-cookie")).toBeNull();
+		});
+
+		it("does not accept a URL another sign-in route returned", async () => {
+			const returned = "https://web.app.example/welcome?state=email-state";
+			const proxyFor = await createIssuer("/sign-in/email-link", returned);
+			const res = await proxyFor(returned);
+			expect(res.status).toBe(400);
+			expect(res.headers.get("set-cookie")).toBeNull();
+		});
+	});
+
+	const signIn = () =>
+		auth.api.signInSocial({
+			body: {
+				provider: "google",
+				callbackURL: "/",
+				disableRedirect: true,
+			},
+		});
+
+	it("sets the signed state cookie for a state the server issued", async () => {
+		const { url } = await signIn();
+		const state = new URL(url!).searchParams.get("state");
+		const res = await proxy(url!);
+		expect(res.status).toBe(302);
+		expect(res.headers.get("location")).toBe(url);
+		expect(res.headers.get("set-cookie")).toContain(
+			`orrery-auth.state=${state}.`,
+		);
+	});
+
+	it("does not sign a state the server did not issue", async () => {
+		const res = await proxy(
+			"https://accounts.google.com/o/oauth2/v2/auth?state=Zx9fA1bC2dE3fG4hI5jK6lM7nO8pQ9rS",
+		);
+		expect(res.status).toBe(302);
+		expect(res.headers.get("set-cookie")).toBeNull();
+	});
+
+	it("does not sign an expired state", async () => {
+		const { url } = await signIn();
+		onTestFinished(() => {
+			vi.useRealTimers();
+		});
+		vi.setSystemTime(Date.now() + 11 * 60 * 1000);
+		const res = await proxy(url!);
+		expect(res.status).toBe(302);
+		expect(res.headers.get("set-cookie")).toBeNull();
+	});
+
+	it("redirects without a state cookie when oauth-proxy rewrites the state", async () => {
+		const { auth } = await getTestInstance({
+			baseURL: "https://preview.example",
+			socialProviders: {
+				google: {
+					clientId: "test",
+					clientSecret: "test",
+				},
+			},
+			plugins: [
+				expo(),
+				oAuthProxy({
+					productionURL: "https://prod.example",
+					currentURL: "https://preview.example",
+				}),
+			],
+		});
+		const { url } = await auth.api.signInSocial({
+			body: {
+				provider: "google",
+				callbackURL: "/",
+				disableRedirect: true,
+			},
+		});
+		const res = await auth.handler(
+			new Request(
+				`https://preview.example/api/auth/expo-authorization-proxy?authorizationURL=${encodeURIComponent(
+					url!,
+				)}`,
+			),
+		);
+		expect(res.status).toBe(302);
+		expect(res.headers.get("location")).toBe(url);
+		expect(res.headers.get("set-cookie")).toBeNull();
+	});
+});

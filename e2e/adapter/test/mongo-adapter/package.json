@@ -1,0 +1,15 @@
+{
+  "name": "@orrery-auth-test/mongo-adapter",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "e2e:integration": "vitest run"
+  },
+  "dependencies": {
+    "@orrery/core": "workspace:*",
+    "@orrery/mongo-adapter": "workspace:*",
+    "@orrery/test-utils": "workspace:*",
+    "@prisma/client": "^7.8.0",
+    "orrery-auth": "workspace:*"
+  }
+}

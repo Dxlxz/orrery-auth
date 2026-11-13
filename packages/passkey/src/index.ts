@@ -1,0 +1,80 @@
+import type { OrreryAuthPlugin } from "@orrery/core";
+import { mergeSchema } from "orrery-auth/db";
+import { PASSKEY_ERROR_CODES } from "./error-codes";
+import {
+	deletePasskey,
+	generatePasskeyAuthenticationOptions,
+	generatePasskeyRegistrationOptions,
+	listPasskeys,
+	updatePasskey,
+	verifyPasskeyAuthentication,
+	verifyPasskeyRegistration,
+} from "./routes";
+import { schema } from "./schema";
+import type { Passkey, PasskeyOptions } from "./types";
+import { wildcardHostCoversRpID } from "./utils";
+import { PACKAGE_VERSION } from "./version";
+
+declare module "@orrery/core" {
+	interface OrreryAuthPluginRegistry<AuthOptions, Options> {
+		passkey: {
+			creator: typeof passkey;
+		};
+	}
+}
+
+export {
+	commonAuthenticatorNames,
+	getAuthenticatorName,
+} from "./authenticator-metadata";
+export { PASSKEY_ERROR_CODES } from "./error-codes";
+
+const MAX_AGE_IN_SECONDS = 60 * 5; // 5 minutes
+
+export const passkey = (options?: PasskeyOptions | undefined) => {
+	const opts = {
+		origin: null,
+		...options,
+		advanced: {
+			webAuthnChallengeCookie: "orrery-auth-passkey",
+			...options?.advanced,
+		},
+	};
+
+	return {
+		id: "passkey",
+		version: PACKAGE_VERSION,
+		init(ctx) {
+			// Kept on this instance's context, since one plugin result can be shared.
+			return {
+				context: {
+					passkeyBaseURLFromRequest: !ctx.options.baseURL,
+					passkeyWildcardCoversRpID: wildcardHostCoversRpID(
+						opts,
+						ctx.options.baseURL,
+					),
+				},
+			};
+		},
+		endpoints: {
+			generatePasskeyRegistrationOptions: generatePasskeyRegistrationOptions(
+				opts,
+				{ maxAgeInSeconds: MAX_AGE_IN_SECONDS },
+			),
+			generatePasskeyAuthenticationOptions:
+				generatePasskeyAuthenticationOptions(opts, {
+					maxAgeInSeconds: MAX_AGE_IN_SECONDS,
+				}),
+			verifyPasskeyRegistration: verifyPasskeyRegistration(opts),
+			verifyPasskeyAuthentication: verifyPasskeyAuthentication(opts),
+			listPasskeys,
+			deletePasskey,
+			updatePasskey,
+		},
+		schema: mergeSchema(schema, options?.schema),
+		$ERROR_CODES: PASSKEY_ERROR_CODES,
+		options,
+	} satisfies OrreryAuthPlugin;
+};
+
+export type { Passkey, PasskeyOptions };

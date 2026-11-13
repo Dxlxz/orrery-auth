@@ -1,0 +1,1302 @@
+import type { GenericEndpointContext } from "@orrery/core";
+import { createAuthEndpoint } from "@orrery/core/api";
+import {
+	getCurrentAdapter,
+	runWithTransaction,
+} from "@orrery/core/context";
+import { APIError } from "@orrery/core/error";
+import { base64 } from "@orrery/utils/base64";
+import { createHash } from "@orrery/utils/hash";
+import type {
+	AuthenticationExtensionsClientInputs,
+	AuthenticationResponseJSON,
+	AuthenticatorTransportFuture,
+} from "@simplewebauthn/server";
+import {
+	generateAuthenticationOptions,
+	generateRegistrationOptions,
+	verifyAuthenticationResponse,
+	verifyRegistrationResponse,
+} from "@simplewebauthn/server";
+import {
+	freshSessionMiddleware,
+	getAuthoritativeSessionFromCtx,
+	getSessionFromCtx,
+	isStateful,
+	requireResourceOwnership,
+	sensitiveSessionMiddleware,
+	sessionMiddleware,
+} from "orrery-auth/api";
+import { setSessionCookie } from "orrery-auth/cookies";
+import { generateRandomString } from "orrery-auth/crypto";
+import type { OpenAPIParameter } from "better-call";
+import * as z from "zod";
+import { PASSKEY_ERROR_CODES } from "./error-codes";
+import type {
+	Passkey,
+	PasskeyExtensionsResolver,
+	PasskeyOptions,
+	PasskeyRegistrationUser,
+	WebAuthnChallengeValue,
+} from "./types";
+import { getExpectedOrigins, getRpID } from "./utils";
+
+type PasskeyCeremony = "registration" | "authentication";
+
+/**
+ * The stored challenge value tagged with the ceremony that minted it.
+ * Registration and authentication share one cookie and one challenge row, so
+ * the verifiers must reject a challenge minted by the other ceremony.
+ */
+type StoredChallengeValue = WebAuthnChallengeValue & {
+	type?: PasskeyCeremony;
+	registrationSource?:
+		| { type: "session"; tokenHash: string }
+		| { type: "resolver" };
+};
+
+/**
+ * Challenge rows are readable by hooks and exports, so they hold a digest of
+ * the session token rather than the token itself.
+ */
+const hashSessionToken = (token: string) =>
+	createHash("SHA-256", "base64urlnopad").digest(token);
+
+async function registrationSourceMatches(
+	source: StoredChallengeValue["registrationSource"],
+	sessionToken: string | undefined,
+) {
+	if (source?.type === "resolver") return true;
+	if (source?.type !== "session" || !sessionToken) return false;
+	return source.tokenHash === (await hashSessionToken(sessionToken));
+}
+
+/**
+ * How a registration that does not require a session started: from a
+ * session, bound by its digest, or through `resolveUser`. Nothing is recorded
+ * when a session is required or sessions are not stored.
+ */
+async function registrationSourceFor(
+	recordSource: boolean,
+	sessionToken: string | undefined,
+): Promise<StoredChallengeValue["registrationSource"]> {
+	if (!recordSource) return undefined;
+	if (!sessionToken) return { type: "resolver" };
+	return {
+		type: "session",
+		tokenHash: await hashSessionToken(sessionToken),
+	};
+}
+
+type WithRequired<T, K extends keyof T> = T & { [P in K]-?: T[P] };
+
+type RequiredPassKeyOptions = WithRequired<PasskeyOptions, "advanced"> & {
+	advanced: Required<PasskeyOptions["advanced"]>;
+};
+
+const expectedOriginUnavailable = (ctx: GenericEndpointContext) => {
+	ctx.context.logger.error(PASSKEY_ERROR_CODES.ORIGIN_NOT_CONFIGURED.message);
+	return APIError.from(
+		"INTERNAL_SERVER_ERROR",
+		PASSKEY_ERROR_CODES.ORIGIN_NOT_CONFIGURED,
+	);
+};
+
+const resolveExtensions = async (
+	extensions: PasskeyExtensionsResolver | undefined,
+	ctx: GenericEndpointContext,
+): Promise<AuthenticationExtensionsClientInputs | undefined> => {
+	if (!extensions) {
+		return undefined;
+	}
+	if (typeof extensions === "function") {
+		return await extensions({ ctx });
+	}
+	return extensions;
+};
+
+const resolveRegistrationUser = async (
+	opts: RequiredPassKeyOptions,
+	ctx: GenericEndpointContext,
+): Promise<PasskeyRegistrationUser> => {
+	const requireSession = opts.registration?.requireSession ?? true;
+	if (requireSession) {
+		const session = ctx.context?.session;
+		if (!session?.user?.id) {
+			throw APIError.from("UNAUTHORIZED", PASSKEY_ERROR_CODES.SESSION_REQUIRED);
+		}
+		const sessionName = session.user.email || session.user.id;
+		return {
+			id: session.user.id,
+			name: sessionName,
+			displayName: sessionName,
+		};
+	}
+
+	const session = await getAuthoritativeSessionFromCtx(ctx);
+	if (session?.user?.id) {
+		const sessionName = session.user.email || session.user.id;
+		return {
+			id: session.user.id,
+			name: sessionName,
+			displayName: sessionName,
+		};
+	}
+
+	if (!opts.registration?.resolveUser) {
+		throw APIError.from(
+			"BAD_REQUEST",
+			PASSKEY_ERROR_CODES.RESOLVE_USER_REQUIRED,
+		);
+	}
+
+	const resolvedUser = await opts.registration.resolveUser({
+		ctx,
+		context: ctx.query?.context ?? null,
+	});
+
+	if (!resolvedUser?.id || !resolvedUser?.name) {
+		throw APIError.from(
+			"BAD_REQUEST",
+			PASSKEY_ERROR_CODES.RESOLVED_USER_INVALID,
+		);
+	}
+
+	return resolvedUser;
+};
+
+const generatePasskeyQuerySchema = z
+	.object({
+		authenticatorAttachment: z.enum(["platform", "cross-platform"]).optional(),
+		name: z.string().optional(),
+		context: z.string().optional(),
+	})
+	.optional();
+
+const generatePasskeyRegistrationOptionsOpenAPIParameters: OpenAPIParameter[] =
+	[
+		{
+			name: "authenticatorAttachment",
+			in: "query",
+			required: false,
+			description: `Type of authenticator to use for registration.
+                          "platform" for device-specific authenticators,
+                          "cross-platform" for authenticators that can be used across devices.`,
+			schema: {
+				type: "string",
+				enum: ["platform", "cross-platform"],
+			},
+		},
+		{
+			name: "name",
+			in: "query",
+			required: false,
+			description: `Optional custom name for the passkey.
+                          This can help identify the passkey when managing multiple credentials.`,
+			schema: {
+				type: "string",
+			},
+		},
+		{
+			name: "context",
+			in: "query",
+			required: false,
+			description: "Optional context for passkey-first registration flows.",
+			schema: {
+				type: "string",
+			},
+		},
+	];
+
+export const generatePasskeyRegistrationOptions = (
+	opts: RequiredPassKeyOptions,
+	{ maxAgeInSeconds }: { maxAgeInSeconds: number },
+) => {
+	const requireSession = opts.registration?.requireSession ?? true;
+	return createAuthEndpoint(
+		"/passkey/generate-register-options",
+		{
+			method: "GET",
+			use: requireSession
+				? [sensitiveSessionMiddleware, freshSessionMiddleware]
+				: [],
+			query: generatePasskeyQuerySchema,
+			metadata: {
+				openapi: {
+					operationId: "generatePasskeyRegistrationOptions",
+					description: "Generate registration options for a new passkey",
+					parameters: generatePasskeyRegistrationOptionsOpenAPIParameters,
+					responses: {
+						200: {
+							description: "Success",
+							content: {
+								"application/json": {
+									schema: {
+										type: "object",
+										properties: {
+											challenge: {
+												type: "string",
+											},
+											rp: {
+												type: "object",
+												properties: {
+													name: {
+														type: "string",
+													},
+													id: {
+														type: "string",
+													},
+												},
+											},
+											user: {
+												type: "object",
+												properties: {
+													id: {
+														type: "string",
+													},
+													name: {
+														type: "string",
+													},
+													displayName: {
+														type: "string",
+													},
+												},
+											},
+											pubKeyCredParams: {
+												type: "array",
+												items: {
+													type: "object",
+													properties: {
+														type: {
+															type: "string",
+														},
+														alg: {
+															type: "number",
+														},
+													},
+												},
+											},
+											timeout: {
+												type: "number",
+											},
+											excludeCredentials: {
+												type: "array",
+												items: {
+													type: "object",
+													properties: {
+														id: {
+															type: "string",
+														},
+														type: {
+															type: "string",
+														},
+														transports: {
+															type: "array",
+															items: {
+																type: "string",
+															},
+														},
+													},
+												},
+											},
+											authenticatorSelection: {
+												type: "object",
+												properties: {
+													authenticatorAttachment: {
+														type: "string",
+													},
+													requireResidentKey: {
+														type: "boolean",
+													},
+													userVerification: {
+														type: "string",
+													},
+												},
+											},
+											attestation: {
+												type: "string",
+											},
+
+											extensions: {
+												type: "object",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		async (ctx) => {
+			const user = await resolveRegistrationUser(opts, ctx);
+			const sessionToken = ctx.context.session?.session?.token;
+			const userPasskeys = await ctx.context.adapter.findMany<Passkey>({
+				model: "passkey",
+				where: [
+					{
+						field: "userId",
+						value: user.id,
+					},
+				],
+			});
+			const registrationExtensions = await resolveExtensions(
+				opts.registration?.extensions,
+				ctx,
+			);
+			const userID = new TextEncoder().encode(
+				generateRandomString(32, "a-z", "0-9"),
+			);
+			const baseURLString =
+				typeof ctx.context.options.baseURL === "string"
+					? ctx.context.options.baseURL
+					: undefined;
+			const options = await generateRegistrationOptions({
+				rpName: opts.rpName || ctx.context.appName,
+				rpID: getRpID(opts, baseURLString),
+				userID,
+				userName: ctx.query?.name || user.name || user.id,
+				userDisplayName: user.displayName || user.name || user.id,
+				attestationType: "none",
+				excludeCredentials: userPasskeys.map((passkey) => ({
+					id: passkey.credentialID,
+					transports: passkey.transports?.split(
+						",",
+					) as AuthenticatorTransportFuture[],
+				})),
+				authenticatorSelection: {
+					residentKey: "preferred",
+					userVerification: "preferred",
+					...(opts.authenticatorSelection || {}),
+					...(ctx.query?.authenticatorAttachment
+						? {
+								authenticatorAttachment: ctx.query.authenticatorAttachment,
+							}
+						: {}),
+				},
+				extensions: registrationExtensions,
+			});
+			const verificationToken = generateRandomString(32);
+			const webAuthnCookie = ctx.context.createAuthCookie(
+				opts.advanced.webAuthnChallengeCookie,
+			);
+			await ctx.setSignedCookie(
+				webAuthnCookie.name,
+				verificationToken,
+				ctx.context.secret,
+				{
+					...webAuthnCookie.attributes,
+					maxAge: maxAgeInSeconds,
+				},
+			);
+			const expirationTime = new Date(Date.now() + maxAgeInSeconds * 1000);
+			await ctx.context.internalAdapter.createVerificationValue({
+				identifier: verificationToken,
+				value: JSON.stringify({
+					type: "registration",
+					registrationSource: await registrationSourceFor(
+						!requireSession && isStateful(ctx),
+						sessionToken,
+					),
+					expectedChallenge: options.challenge,
+					userData: {
+						id: user.id,
+						name: user.name,
+						displayName: user.displayName,
+					},
+					context: ctx.query?.context ?? null,
+				} satisfies StoredChallengeValue),
+				expiresAt: expirationTime,
+			});
+			return ctx.json(options, {
+				status: 200,
+			});
+		},
+	);
+};
+
+export const generatePasskeyAuthenticationOptions = (
+	opts: RequiredPassKeyOptions,
+	{ maxAgeInSeconds }: { maxAgeInSeconds: number },
+) =>
+	createAuthEndpoint(
+		"/passkey/generate-authenticate-options",
+		{
+			method: "GET",
+			metadata: {
+				openapi: {
+					operationId: "passkeyGenerateAuthenticateOptions",
+					description: "Generate authentication options for a passkey",
+					responses: {
+						200: {
+							description: "Success",
+							content: {
+								"application/json": {
+									schema: {
+										type: "object",
+										properties: {
+											challenge: {
+												type: "string",
+											},
+											rp: {
+												type: "object",
+												properties: {
+													name: {
+														type: "string",
+													},
+													id: {
+														type: "string",
+													},
+												},
+											},
+											user: {
+												type: "object",
+												properties: {
+													id: {
+														type: "string",
+													},
+													name: {
+														type: "string",
+													},
+													displayName: {
+														type: "string",
+													},
+												},
+											},
+											timeout: {
+												type: "number",
+											},
+											allowCredentials: {
+												type: "array",
+												items: {
+													type: "object",
+													properties: {
+														id: {
+															type: "string",
+														},
+														type: {
+															type: "string",
+														},
+														transports: {
+															type: "array",
+															items: {
+																type: "string",
+															},
+														},
+													},
+												},
+											},
+											userVerification: {
+												type: "string",
+											},
+											authenticatorSelection: {
+												type: "object",
+												properties: {
+													authenticatorAttachment: {
+														type: "string",
+													},
+													requireResidentKey: {
+														type: "boolean",
+													},
+													userVerification: {
+														type: "string",
+													},
+												},
+											},
+											extensions: {
+												type: "object",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		async (ctx) => {
+			const session = await getSessionFromCtx(ctx);
+			let userPasskeys: Passkey[] = [];
+			if (session) {
+				userPasskeys = await ctx.context.adapter.findMany<Passkey>({
+					model: "passkey",
+					where: [
+						{
+							field: "userId",
+							value: session.user.id,
+						},
+					],
+				});
+			}
+			const baseURLString =
+				typeof ctx.context.options.baseURL === "string"
+					? ctx.context.options.baseURL
+					: undefined;
+			const authenticationExtensions = await resolveExtensions(
+				opts.authentication?.extensions,
+				ctx,
+			);
+			const options = await generateAuthenticationOptions({
+				rpID: getRpID(opts, baseURLString),
+				userVerification:
+					opts.authenticatorSelection?.userVerification ?? "preferred",
+				extensions: authenticationExtensions,
+				...(userPasskeys.length
+					? {
+							allowCredentials: userPasskeys.map((passkey) => ({
+								id: passkey.credentialID,
+								transports: passkey.transports?.split(
+									",",
+								) as AuthenticatorTransportFuture[],
+							})),
+						}
+					: {}),
+			});
+			const data = {
+				type: "authentication",
+				expectedChallenge: options.challenge,
+				userData: {
+					id: session?.user.id || "",
+				},
+			} satisfies StoredChallengeValue;
+			const verificationToken = generateRandomString(32);
+			const webAuthnCookie = ctx.context.createAuthCookie(
+				opts.advanced.webAuthnChallengeCookie,
+			);
+			await ctx.setSignedCookie(
+				webAuthnCookie.name,
+				verificationToken,
+				ctx.context.secret,
+				{
+					...webAuthnCookie.attributes,
+					maxAge: maxAgeInSeconds,
+				},
+			);
+			const expirationTime = new Date(Date.now() + maxAgeInSeconds * 1000);
+			await ctx.context.internalAdapter.createVerificationValue({
+				identifier: verificationToken,
+				value: JSON.stringify(data),
+				expiresAt: expirationTime,
+			});
+			return ctx.json(options, {
+				status: 200,
+			});
+		},
+	);
+
+const verifyPasskeyRegistrationBodySchema = z.object({
+	response: z.any(),
+	name: z
+		.string()
+		.trim()
+		.meta({
+			description: "Name of the passkey",
+		})
+		.optional(),
+	createSession: z
+		.boolean()
+		.meta({
+			description: "Create a session after registering the passkey",
+		})
+		.optional(),
+});
+
+const passkeyRegistrationResponseSchema = {
+	type: "object",
+	allOf: [
+		{ $ref: "#/components/schemas/Passkey" },
+		{
+			type: "object",
+			properties: {
+				session: { $ref: "#/components/schemas/Session" },
+				user: { $ref: "#/components/schemas/User" },
+			},
+		},
+	],
+} as const;
+
+export const verifyPasskeyRegistration = (options: RequiredPassKeyOptions) => {
+	const requireSession = options.registration?.requireSession ?? true;
+	return createAuthEndpoint(
+		"/passkey/verify-registration",
+		{
+			method: "POST",
+			body: verifyPasskeyRegistrationBodySchema,
+			use: requireSession
+				? [sensitiveSessionMiddleware, freshSessionMiddleware]
+				: [],
+			metadata: {
+				openapi: {
+					operationId: "passkeyVerifyRegistration",
+					description: "Verify registration of a new passkey",
+					responses: {
+						200: {
+							description: "Success",
+							content: {
+								"application/json": {
+									schema: passkeyRegistrationResponseSchema,
+								},
+							},
+						},
+						400: {
+							description: "Bad request",
+						},
+					},
+				},
+			},
+		},
+		async (ctx) => {
+			const resp = ctx.body.response;
+			const expectedOrigin = getExpectedOrigins(
+				options,
+				ctx,
+				resp?.response?.clientDataJSON,
+			);
+			if (!expectedOrigin) {
+				throw expectedOriginUnavailable(ctx);
+			}
+			if (expectedOrigin.length === 0) {
+				throw APIError.from(
+					"BAD_REQUEST",
+					PASSKEY_ERROR_CODES.FAILED_TO_VERIFY_REGISTRATION,
+				);
+			}
+			const webAuthnCookie = ctx.context.createAuthCookie(
+				options.advanced.webAuthnChallengeCookie,
+			);
+			const verificationToken = await ctx.getSignedCookie(
+				webAuthnCookie.name,
+				ctx.context.secret,
+			);
+			if (!verificationToken) {
+				throw APIError.from(
+					"BAD_REQUEST",
+					PASSKEY_ERROR_CODES.CHALLENGE_NOT_FOUND,
+				);
+			}
+
+			const data =
+				await ctx.context.internalAdapter.consumeVerificationValue(
+					verificationToken,
+				);
+			if (!data) {
+				throw APIError.from(
+					"BAD_REQUEST",
+					PASSKEY_ERROR_CODES.CHALLENGE_NOT_FOUND,
+				);
+			}
+			const {
+				type: ceremony,
+				registrationSource,
+				expectedChallenge,
+				userData,
+				context,
+			} = JSON.parse(data.value) as StoredChallengeValue;
+			if (ceremony !== "registration") {
+				throw APIError.from(
+					"BAD_REQUEST",
+					PASSKEY_ERROR_CODES.CHALLENGE_NOT_FOUND,
+				);
+			}
+
+			const session = requireSession
+				? ctx.context.session
+				: await getAuthoritativeSessionFromCtx(ctx);
+			if (
+				!requireSession &&
+				isStateful(ctx) &&
+				!(await registrationSourceMatches(
+					registrationSource,
+					session?.session.token,
+				))
+			) {
+				throw APIError.from(
+					"UNAUTHORIZED",
+					PASSKEY_ERROR_CODES.SESSION_REQUIRED,
+				);
+			}
+			if (session?.user?.id && userData.id !== session.user.id) {
+				throw APIError.from(
+					"UNAUTHORIZED",
+					PASSKEY_ERROR_CODES.YOU_ARE_NOT_ALLOWED_TO_REGISTER_THIS_PASSKEY,
+				);
+			}
+
+			try {
+				const verifyBaseURL =
+					typeof ctx.context.options.baseURL === "string"
+						? ctx.context.options.baseURL
+						: undefined;
+				// The verifier throws on a rejected response (origin, user verification),
+				// which is a client error, not a server failure.
+				const verification = await verifyRegistrationResponse({
+					response: resp,
+					expectedChallenge,
+					expectedOrigin,
+					expectedRPID: getRpID(options, verifyBaseURL),
+					requireUserVerification:
+						options.authenticatorSelection?.userVerification === "required",
+				}).catch((e) => {
+					ctx.context.logger.error("Failed to verify registration", e);
+					return null;
+				});
+				const registrationInfo = verification?.registrationInfo;
+				if (!verification?.verified || !registrationInfo) {
+					throw APIError.from(
+						"BAD_REQUEST",
+						PASSKEY_ERROR_CODES.FAILED_TO_VERIFY_REGISTRATION,
+					);
+				}
+				const { aaguid, credentialDeviceType, credentialBackedUp, credential } =
+					registrationInfo;
+				const persistRegistration = async () => {
+					const resolvedUser: PasskeyRegistrationUser = {
+						id: userData.id,
+						name: userData.name || userData.id,
+						displayName: userData.displayName,
+					};
+					let targetUserId = resolvedUser.id;
+					let resolvedName = ctx.body.name || undefined;
+					if (options.registration?.afterVerification) {
+						const result = await options.registration.afterVerification({
+							ctx,
+							verification,
+							user: resolvedUser,
+							clientData: resp,
+							context,
+						});
+						if (result?.userId) {
+							if (typeof result.userId !== "string" || !result.userId) {
+								throw APIError.from(
+									"BAD_REQUEST",
+									PASSKEY_ERROR_CODES.RESOLVED_USER_INVALID,
+								);
+							}
+							if (session?.user?.id && result.userId !== session.user.id) {
+								throw APIError.from(
+									"UNAUTHORIZED",
+									PASSKEY_ERROR_CODES.YOU_ARE_NOT_ALLOWED_TO_REGISTER_THIS_PASSKEY,
+								);
+							}
+							targetUserId = result.userId;
+						}
+						if (!resolvedName) {
+							resolvedName = result?.name?.trim() || undefined;
+						}
+					}
+					if (!targetUserId) {
+						throw APIError.from(
+							"BAD_REQUEST",
+							PASSKEY_ERROR_CODES.RESOLVED_USER_INVALID,
+						);
+					}
+
+					const user = ctx.body.createSession
+						? await ctx.context.internalAdapter.findUserById(targetUserId)
+						: null;
+					if (ctx.body.createSession && !user) {
+						throw APIError.from(
+							"INTERNAL_SERVER_ERROR",
+							PASSKEY_ERROR_CODES.USER_NOT_FOUND,
+						);
+					}
+
+					const pubKey = base64.encode(credential.publicKey);
+					const adapter = await getCurrentAdapter(ctx.context.adapter);
+					const passkey = await adapter.create<Omit<Passkey, "id">, Passkey>({
+						model: "passkey",
+						data: {
+							name: resolvedName,
+							userId: targetUserId,
+							credentialID: credential.id,
+							publicKey: pubKey,
+							counter: credential.counter,
+							deviceType: credentialDeviceType,
+							transports: resp.response.transports?.join(",") ?? "",
+							backedUp: credentialBackedUp,
+							createdAt: new Date(),
+							aaguid,
+						},
+					});
+					if (!user) {
+						return { passkey };
+					}
+
+					const createdSession =
+						await ctx.context.internalAdapter.createSession(
+							targetUserId,
+							undefined,
+							undefined,
+							undefined,
+							{ deferSecondaryStorageWrites: true },
+						);
+					if (!createdSession) {
+						throw APIError.from(
+							"INTERNAL_SERVER_ERROR",
+							PASSKEY_ERROR_CODES.UNABLE_TO_CREATE_SESSION,
+						);
+					}
+					return { passkey, session: createdSession, user };
+				};
+				const registration = ctx.body.createSession
+					? await runWithTransaction(ctx.context.adapter, persistRegistration)
+					: await persistRegistration();
+
+				if (registration.session && registration.user) {
+					await setSessionCookie(ctx, {
+						session: registration.session,
+						user: registration.user,
+					});
+					return ctx.json(
+						{
+							...registration.passkey,
+							session: registration.session,
+							user: registration.user,
+						},
+						{
+							status: 200,
+						},
+					);
+				}
+				return ctx.json(registration.passkey, {
+					status: 200,
+				});
+			} catch (e) {
+				if (e instanceof APIError) throw e;
+				ctx.context.logger.error("Failed to verify registration", e);
+				throw APIError.from(
+					"INTERNAL_SERVER_ERROR",
+					PASSKEY_ERROR_CODES.FAILED_TO_VERIFY_REGISTRATION,
+				);
+			}
+		},
+	);
+};
+
+const verifyPasskeyAuthenticationBodySchema = z.object({
+	response: z.record(z.any(), z.any()),
+});
+
+export const verifyPasskeyAuthentication = (options: RequiredPassKeyOptions) =>
+	createAuthEndpoint(
+		"/passkey/verify-authentication",
+		{
+			method: "POST",
+			body: verifyPasskeyAuthenticationBodySchema,
+			metadata: {
+				openapi: {
+					operationId: "passkeyVerifyAuthentication",
+					description: "Verify authentication of a passkey",
+					responses: {
+						200: {
+							description: "Success",
+							content: {
+								"application/json": {
+									schema: {
+										type: "object",
+										properties: {
+											session: {
+												$ref: "#/components/schemas/Session",
+											},
+											user: {
+												$ref: "#/components/schemas/User",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				$Infer: {
+					body: {} as {
+						response: AuthenticationResponseJSON;
+					},
+				},
+			},
+		},
+		async (ctx) => {
+			const resp = ctx.body.response;
+			const expectedOrigin = getExpectedOrigins(
+				options,
+				ctx,
+				resp?.response?.clientDataJSON,
+			);
+			if (!expectedOrigin) {
+				throw expectedOriginUnavailable(ctx);
+			}
+			if (expectedOrigin.length === 0) {
+				throw APIError.from(
+					"BAD_REQUEST",
+					PASSKEY_ERROR_CODES.AUTHENTICATION_FAILED,
+				);
+			}
+			const webAuthnCookie = ctx.context.createAuthCookie(
+				options.advanced.webAuthnChallengeCookie,
+			);
+			const verificationToken = await ctx.getSignedCookie(
+				webAuthnCookie.name,
+				ctx.context.secret,
+			);
+			if (!verificationToken) {
+				throw APIError.from(
+					"BAD_REQUEST",
+					PASSKEY_ERROR_CODES.CHALLENGE_NOT_FOUND,
+				);
+			}
+
+			const data =
+				await ctx.context.internalAdapter.consumeVerificationValue(
+					verificationToken,
+				);
+			if (!data) {
+				throw APIError.from(
+					"BAD_REQUEST",
+					PASSKEY_ERROR_CODES.CHALLENGE_NOT_FOUND,
+				);
+			}
+			const { type: ceremony, expectedChallenge } = JSON.parse(
+				data.value,
+			) as StoredChallengeValue;
+			if (ceremony !== "authentication") {
+				throw APIError.from(
+					"BAD_REQUEST",
+					PASSKEY_ERROR_CODES.CHALLENGE_NOT_FOUND,
+				);
+			}
+			const passkey = await ctx.context.adapter.findOne<Passkey>({
+				model: "passkey",
+				where: [
+					{
+						field: "credentialID",
+						value: resp.id,
+					},
+				],
+			});
+			if (!passkey) {
+				throw APIError.from(
+					"UNAUTHORIZED",
+					PASSKEY_ERROR_CODES.PASSKEY_NOT_FOUND,
+				);
+			}
+			try {
+				const authBaseURL =
+					typeof ctx.context.options.baseURL === "string"
+						? ctx.context.options.baseURL
+						: undefined;
+				const verification = await verifyAuthenticationResponse({
+					response: resp as AuthenticationResponseJSON,
+					expectedChallenge,
+					expectedOrigin,
+					expectedRPID: getRpID(options, authBaseURL),
+					credential: {
+						id: passkey.credentialID,
+						publicKey: base64.decode(passkey.publicKey),
+						counter: passkey.counter,
+						transports: passkey.transports?.split(
+							",",
+						) as AuthenticatorTransportFuture[],
+					},
+					requireUserVerification:
+						options.authenticatorSelection?.userVerification === "required",
+				});
+				const { verified } = verification;
+				if (!verified)
+					throw APIError.from(
+						"UNAUTHORIZED",
+						PASSKEY_ERROR_CODES.AUTHENTICATION_FAILED,
+					);
+
+				if (options.authentication?.afterVerification) {
+					await options.authentication.afterVerification({
+						ctx,
+						verification,
+						clientData: resp as AuthenticationResponseJSON,
+					});
+				}
+
+				await ctx.context.adapter.update<Passkey>({
+					model: "passkey",
+					where: [
+						{
+							field: "id",
+							value: passkey.id,
+						},
+					],
+					update: {
+						counter: verification.authenticationInfo.newCounter,
+					},
+				});
+				const s = await ctx.context.internalAdapter.createSession(
+					passkey.userId,
+				);
+				if (!s) {
+					throw APIError.from(
+						"INTERNAL_SERVER_ERROR",
+						PASSKEY_ERROR_CODES.UNABLE_TO_CREATE_SESSION,
+					);
+				}
+				const user = await ctx.context.internalAdapter.findUserById(
+					passkey.userId,
+				);
+				if (!user) {
+					throw new APIError("INTERNAL_SERVER_ERROR", {
+						message: "User not found",
+					});
+				}
+				await setSessionCookie(ctx, {
+					session: s,
+					user,
+				});
+
+				return ctx.json(
+					{
+						session: s,
+						user,
+					},
+					{
+						status: 200,
+					},
+				);
+			} catch (e) {
+				if (e instanceof APIError) throw e;
+				ctx.context.logger.error("Failed to verify authentication", e);
+				throw APIError.from(
+					"BAD_REQUEST",
+					PASSKEY_ERROR_CODES.AUTHENTICATION_FAILED,
+				);
+			}
+		},
+	);
+
+/**
+ * ### Endpoint
+ *
+ * GET `/passkey/list-user-passkeys`
+ *
+ * ### API Methods
+ *
+ * **server:**
+ * `auth.api.listPasskeys`
+ *
+ * **client:**
+ * `authClient.passkey.listUserPasskeys`
+ *
+ * @see [Read our docs to learn more.](https://orrery-auth.com/docs/plugins/passkey#api-method-passkey-list-user-passkeys)
+ */
+export const listPasskeys = createAuthEndpoint(
+	"/passkey/list-user-passkeys",
+	{
+		method: "GET",
+		use: [sessionMiddleware],
+		metadata: {
+			openapi: {
+				description: "List all passkeys for the authenticated user",
+				responses: {
+					"200": {
+						description: "Passkeys retrieved successfully",
+						content: {
+							"application/json": {
+								schema: {
+									type: "array",
+									items: {
+										$ref: "#/components/schemas/Passkey",
+										required: [
+											"id",
+											"userId",
+											"publicKey",
+											"createdAt",
+											"updatedAt",
+										],
+									},
+									description:
+										"Array of passkey objects associated with the user",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	},
+	async (ctx) => {
+		const passkeys = await ctx.context.adapter.findMany<Passkey>({
+			model: "passkey",
+			where: [{ field: "userId", value: ctx.context.session.user.id }],
+		});
+		return ctx.json(passkeys, {
+			status: 200,
+		});
+	},
+);
+
+const deletePasskeyBodySchema = z.object({
+	id: z.string().meta({
+		description: 'The ID of the passkey to delete. Eg: "some-passkey-id"',
+	}),
+});
+
+/**
+ * ### Endpoint
+ *
+ * POST `/passkey/delete-passkey`
+ *
+ * ### API Methods
+ *
+ * **server:**
+ * `auth.api.deletePasskey`
+ *
+ * **client:**
+ * `authClient.passkey.deletePasskey`
+ *
+ * @see [Read our docs to learn more.](https://orrery-auth.com/docs/plugins/passkey#api-method-passkey-delete-passkey)
+ */
+export const deletePasskey = createAuthEndpoint(
+	"/passkey/delete-passkey",
+	{
+		method: "POST",
+		body: deletePasskeyBodySchema,
+		use: [
+			sessionMiddleware,
+			requireResourceOwnership({
+				model: "passkey",
+				idParam: "id",
+				idSource: "body",
+				notFoundError: PASSKEY_ERROR_CODES.PASSKEY_NOT_FOUND,
+				forbiddenStatus: "UNAUTHORIZED",
+			}),
+		],
+		metadata: {
+			openapi: {
+				description: "Delete a specific passkey",
+				responses: {
+					"200": {
+						description: "Passkey deleted successfully",
+						content: {
+							"application/json": {
+								schema: {
+									type: "object",
+									properties: {
+										status: {
+											type: "boolean",
+											description:
+												"Indicates whether the deletion was successful",
+										},
+									},
+									required: ["status"],
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	},
+	async (ctx) => {
+		await ctx.context.adapter.delete({
+			model: "passkey",
+			where: [{ field: "id", value: ctx.body.id }],
+		});
+		return ctx.json({
+			status: true,
+		});
+	},
+);
+
+const updatePassKeyBodySchema = z.object({
+	id: z.string().meta({
+		description: `The ID of the passkey which will be updated. Eg: \"passkey-id\"`,
+	}),
+	name: z.string().trim().min(1).meta({
+		description: `The new name which the passkey will be updated to. Eg: \"my-new-passkey-name\"`,
+	}),
+});
+
+/**
+ * ### Endpoint
+ *
+ * POST `/passkey/update-passkey`
+ *
+ * ### API Methods
+ *
+ * **server:**
+ * `auth.api.updatePasskey`
+ *
+ * **client:**
+ * `authClient.passkey.updatePasskey`
+ *
+ * @see [Read our docs to learn more.](https://orrery-auth.com/docs/plugins/passkey#api-method-passkey-update-passkey)
+ */
+export const updatePasskey = createAuthEndpoint(
+	"/passkey/update-passkey",
+	{
+		method: "POST",
+		body: updatePassKeyBodySchema,
+		use: [
+			sessionMiddleware,
+			requireResourceOwnership({
+				model: "passkey",
+				idParam: "id",
+				idSource: "body",
+				notFoundError: PASSKEY_ERROR_CODES.PASSKEY_NOT_FOUND,
+				forbiddenError:
+					PASSKEY_ERROR_CODES.YOU_ARE_NOT_ALLOWED_TO_REGISTER_THIS_PASSKEY,
+				forbiddenStatus: "UNAUTHORIZED",
+			}),
+		],
+		metadata: {
+			openapi: {
+				description: "Update a specific passkey's name",
+				responses: {
+					"200": {
+						description: "Passkey updated successfully",
+						content: {
+							"application/json": {
+								schema: {
+									type: "object",
+									properties: {
+										passkey: {
+											$ref: "#/components/schemas/Passkey",
+										},
+									},
+									required: ["passkey"],
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	},
+	async (ctx) => {
+		const updatedPasskey = await ctx.context.adapter.update<Passkey>({
+			model: "passkey",
+			where: [
+				{
+					field: "id",
+					value: ctx.body.id,
+				},
+			],
+			update: {
+				name: ctx.body.name,
+			},
+		});
+
+		if (!updatedPasskey) {
+			throw APIError.from(
+				"INTERNAL_SERVER_ERROR",
+				PASSKEY_ERROR_CODES.FAILED_TO_UPDATE_PASSKEY,
+			);
+		}
+		return ctx.json(
+			{
+				passkey: updatedPasskey,
+			},
+			{
+				status: 200,
+			},
+		);
+	},
+);

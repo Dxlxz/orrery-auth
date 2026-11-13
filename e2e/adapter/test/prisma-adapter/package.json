@@ -1,0 +1,22 @@
+{
+  "name": "@orrery-auth-test/prisma-adapter",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "e2e:integration": "vitest run",
+    "prepare": "prisma generate"
+  },
+  "devDependencies": {
+    "@orrery/core": "workspace:*",
+    "@orrery/prisma-adapter": "workspace:*",
+    "@orrery/scim": "workspace:*",
+    "@orrery/test-utils": "workspace:*",
+    "@prisma/adapter-better-sqlite3": "^7.8.0",
+    "@prisma/adapter-mariadb": "^7.10.1",
+    "@prisma/adapter-pg": "^7.8.0",
+    "@prisma/client": "^7.8.0",
+    "orrery-auth": "workspace:*",
+    "better-sqlite3": "^12.11.1",
+    "prisma": "^7.8.0"
+  }
+}

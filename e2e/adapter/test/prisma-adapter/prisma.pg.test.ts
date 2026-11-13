@@ -1,0 +1,59 @@
+import type { OrreryAuthOptions } from "@orrery/core";
+import { prismaAdapter } from "@orrery/prisma-adapter";
+import { testAdapter } from "@orrery/test-utils/adapter";
+import {
+	authFlowTestSuite,
+	caseInsensitiveTestSuite,
+	joinsTestSuite,
+	normalTestSuite,
+	numberIdTestSuite,
+	transactionsTestSuite,
+	uuidTestSuite,
+} from "../adapter-factory";
+import { scimHttpTestSuite } from "../adapter-factory/scim-http-test-suite";
+import { generateAuthConfigFile } from "./generate-auth-config";
+import { generatePrismaSchema } from "./generate-prisma-schema";
+import {
+	destroyPrismaClient,
+	getPrismaClient,
+	incrementMigrationCount,
+} from "./get-prisma-client";
+import { pushPrismaSchema } from "./push-prisma-schema";
+
+const dialect = "postgresql";
+const { execute } = await testAdapter({
+	adapter: async () => {
+		const db = await getPrismaClient(dialect);
+		return prismaAdapter(db, {
+			provider: dialect,
+			debugLogs: { isRunningAdapterTests: true },
+			transaction: true,
+		});
+	},
+	runMigrations: async (options: OrreryAuthOptions) => {
+		const db = await getPrismaClient(dialect);
+		const migrationCount = incrementMigrationCount();
+		await generateAuthConfigFile(options);
+		await generatePrismaSchema(options, db, migrationCount, dialect);
+		await pushPrismaSchema(dialect, db);
+		destroyPrismaClient({ migrationCount: migrationCount - 1, dialect });
+	},
+	tests: [
+		normalTestSuite(),
+		transactionsTestSuite(),
+		authFlowTestSuite(),
+		numberIdTestSuite(),
+		joinsTestSuite(),
+		uuidTestSuite({}),
+		caseInsensitiveTestSuite(),
+		scimHttpTestSuite({
+			connectionId: "prisma-postgres-workforce",
+			token: "prisma-postgres-scim-token",
+			testId: "prisma-postgres",
+		}),
+	],
+	onFinish: async () => {},
+	prefixTests: "pg",
+});
+
+execute();
